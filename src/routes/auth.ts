@@ -4,7 +4,10 @@ import {
   loginUser,
   refreshAccessToken,
   revokeRefreshToken,
+  requestPasswordReset,
+  resetPassword,
 } from '../services/auth.service.js';
+import { sendPasswordResetEmail } from '../services/notification.service.js';
 
 const loginBody = z.object({
   email: z.string().email(),
@@ -13,6 +16,15 @@ const loginBody = z.object({
 
 const refreshBody = z.object({
   refreshToken: z.string(),
+});
+
+const forgotPasswordBody = z.object({
+  email: z.string().email(),
+});
+
+const resetPasswordBody = z.object({
+  token: z.string().min(1),
+  password: z.string().min(8),
 });
 
 export default async function authRoutes(fastify: FastifyInstance) {
@@ -82,6 +94,50 @@ export default async function authRoutes(fastify: FastifyInstance) {
       return reply.status(204).send();
     }
   );
+
+  // POST /api/v1/auth/forgot-password
+  fastify.post('/auth/forgot-password', async (request, reply) => {
+    const parsed = forgotPasswordBody.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.status(400).send({ error: 'Invalid request body' });
+    }
+
+    const result = await requestPasswordReset(fastify.prisma, parsed.data.email);
+    if (result) {
+      sendPasswordResetEmail({
+        toEmail: result.user.email,
+        resetToken: result.plainToken,
+      }).catch((err) =>
+        fastify.log.error({ err }, 'Failed to send password reset email')
+      );
+    }
+
+    // Always return a generic response so we don't leak which emails are registered
+    return reply.send({
+      ok: true,
+      message: 'If that email is registered, a reset link has been sent.',
+    });
+  });
+
+  // POST /api/v1/auth/reset-password
+  fastify.post('/auth/reset-password', async (request, reply) => {
+    const parsed = resetPasswordBody.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.status(400).send({ error: 'Invalid request body' });
+    }
+
+    const success = await resetPassword(
+      fastify.prisma,
+      parsed.data.token,
+      parsed.data.password
+    );
+
+    if (!success) {
+      return reply.status(400).send({ error: 'Invalid or expired reset token' });
+    }
+
+    return reply.send({ ok: true });
+  });
 
   // GET /api/v1/auth/me
   fastify.get(

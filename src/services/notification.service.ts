@@ -122,6 +122,23 @@ export async function sendUnassignedDeviceAlert(opts: {
   ]);
 }
 
+export async function sendPasswordResetEmail(opts: {
+  toEmail: string;
+  resetToken: string;
+}) {
+  const resetUrl = `${config.APP_BASE_URL}/reset-password/${opts.resetToken}`;
+  await sendEmail({
+    to: opts.toEmail,
+    subject: 'Reset your password',
+    html: `
+      <p>We received a request to reset your password.</p>
+      <p>Click the link below to choose a new one:</p>
+      <p><a href="${resetUrl}">${resetUrl}</a></p>
+      <p>This link expires in 1 hour. If you didn't request this, you can ignore this email.</p>
+    `,
+  });
+}
+
 export async function sendOffboardingAlert(opts: {
   itEmail: string;
   employeeName: string;

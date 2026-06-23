@@ -213,6 +213,14 @@ export default async function employeeRoutes(fastify: FastifyInstance) {
         data: { status: 'offboarded' },
       });
 
+      // Free up their devices — close any open assignments
+      if (employee.assignments.length > 0) {
+        await fastify.prisma.deviceAssignment.updateMany({
+          where: { employeeId: id, returnedAt: null },
+          data: { returnedAt: new Date() },
+        });
+      }
+
       await logAudit(fastify.prisma, {
         orgId,
         userId,
@@ -249,6 +257,38 @@ export default async function employeeRoutes(fastify: FastifyInstance) {
         ok: true,
         assignedDevices: employee.assignments.map((a) => a.device),
       });
+    }
+  );
+
+  // POST /api/v1/employees/:id/reactivate
+  fastify.post(
+    '/employees/:id/reactivate',
+    { preHandler: operator },
+    async (request, reply) => {
+      const { id } = request.params as { id: string };
+      const { orgId, sub: userId } = request.user;
+
+      const employee = await fastify.prisma.employee.findFirst({
+        where: { id, orgId, status: 'offboarded' },
+      });
+      if (!employee) {
+        return reply.status(404).send({ error: 'Employee not found or already active' });
+      }
+
+      const updated = await fastify.prisma.employee.update({
+        where: { id },
+        data: { status: 'active' },
+      });
+
+      await logAudit(fastify.prisma, {
+        orgId,
+        userId,
+        action: 'employee.reactivated',
+        resourceType: 'employee',
+        resourceId: id,
+      });
+
+      return reply.send(updated);
     }
   );
 }

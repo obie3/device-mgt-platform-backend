@@ -9,8 +9,10 @@ declare module 'fastify' {
       reply: FastifyReply
     ) => Promise<void>;
   }
+}
 
-  interface FastifyRequest {
+declare module '@fastify/jwt' {
+  interface FastifyJWT {
     user: {
       sub: string;    // userId
       orgId: string;

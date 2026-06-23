@@ -154,3 +154,62 @@ export async function hashPassword(password: string) {
   // Cost 10: ~100ms — OWASP minimum, well below cost 12's ~400ms
   return bcrypt.hash(password, 10);
 }
+
+// ---------------------------------------------------------------------------
+// Password reset
+// ---------------------------------------------------------------------------
+
+const RESET_TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hour
+
+export async function requestPasswordReset(prisma: PrismaClient, email: string) {
+  const user = await prisma.user.findUnique({ where: { email } });
+  if (!user || !user.isActive) return null;
+
+  const plainToken = crypto.randomBytes(32).toString('hex');
+  await prisma.passwordResetToken.create({
+    data: {
+      userId: user.id,
+      tokenHash: hashToken(plainToken),
+      expiresAt: new Date(Date.now() + RESET_TOKEN_TTL_MS),
+    },
+  });
+
+  return { user, plainToken };
+}
+
+export async function resetPassword(
+  prisma: PrismaClient,
+  plainToken: string,
+  newPassword: string
+) {
+  const tokenHash = hashToken(plainToken);
+  const resetToken = await prisma.passwordResetToken.findUnique({
+    where: { tokenHash },
+  });
+
+  if (
+    !resetToken ||
+    resetToken.usedAt ||
+    resetToken.expiresAt < new Date()
+  ) {
+    return false;
+  }
+
+  const passwordHash = await hashPassword(newPassword);
+
+  await prisma.$transaction([
+    prisma.user.update({
+      where: { id: resetToken.userId },
+      data: { passwordHash },
+    }),
+    prisma.passwordResetToken.update({
+      where: { id: resetToken.id },
+      data: { usedAt: new Date() },
+    }),
+  ]);
+
+  // Invalidate existing sessions on password change
+  await revokeAllUserTokens(prisma, resetToken.userId);
+
+  return true;
+}
