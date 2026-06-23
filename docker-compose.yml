@@ -1,0 +1,50 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: dmp-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: dmp
+      POSTGRES_PASSWORD: dmp_secret
+      POSTGRES_DB: dmp
+    ports:
+      - '5433:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U dmp -d dmp']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: dmp-api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://dmp:dmp_secret@postgres:5432/dmp
+      PORT: 3001
+      NODE_ENV: production
+    env_file:
+      - .env
+    ports:
+      - '3001:3001'
+
+  web:
+    build:
+      context: ../dmp-web
+      dockerfile: Dockerfile
+    container_name: dmp-web
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - '3000:80'
+
+volumes:
+  postgres_data:

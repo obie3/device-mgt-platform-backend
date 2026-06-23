@@ -1,0 +1,223 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum UserRole {
+  admin
+  operator
+  viewer
+}
+
+enum DeviceType {
+  laptop
+  mobile
+  tablet
+  other
+}
+
+enum DeviceStatus {
+  active
+  inactive
+  decommissioned
+}
+
+enum EmployeeStatus {
+  active
+  offboarded
+}
+
+enum AlertType {
+  stale_device
+  unassigned_device
+}
+
+// ---------------------------------------------------------------------------
+// Organizations — top-level tenant
+// ---------------------------------------------------------------------------
+
+model Organization {
+  id                  String   @id @default(cuid())
+  name                String
+  staleThresholdDays  Int      @default(14) @map("stale_threshold_days")
+  unassignedAlertDays Int      @default(7)  @map("unassigned_alert_days")
+  settings            Json     @default("{}")
+  createdAt           DateTime @default(now()) @map("created_at")
+  updatedAt           DateTime @updatedAt     @map("updated_at")
+
+  users       User[]
+  employees   Employee[]
+  devices     Device[]
+  auditLogs   AuditLog[]
+
+  @@map("organizations")
+}
+
+// ---------------------------------------------------------------------------
+// Users — platform login accounts (email + password, no OIDC)
+// ---------------------------------------------------------------------------
+
+model User {
+  id           String   @id @default(cuid())
+  orgId        String   @map("org_id")
+  name         String
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  role         UserRole @default(viewer)
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt     @map("updated_at")
+
+  org           Organization   @relation(fields: [orgId], references: [id])
+  refreshTokens RefreshToken[]
+  auditLogs     AuditLog[]
+
+  @@index([orgId])
+  @@map("users")
+}
+
+// ---------------------------------------------------------------------------
+// Refresh tokens — hashed, one row per issued token
+// ---------------------------------------------------------------------------
+
+model RefreshToken {
+  id        String    @id @default(cuid())
+  userId    String    @map("user_id")
+  tokenHash String    @unique @map("token_hash")
+  expiresAt DateTime  @map("expires_at")
+  revokedAt DateTime? @map("revoked_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+// ---------------------------------------------------------------------------
+// Employees — people who hold devices (not platform users)
+// ---------------------------------------------------------------------------
+
+model Employee {
+  id         String         @id @default(cuid())
+  orgId      String         @map("org_id")
+  name       String
+  email      String
+  department String?
+  status     EmployeeStatus @default(active)
+  createdAt  DateTime       @default(now()) @map("created_at")
+  updatedAt  DateTime       @updatedAt     @map("updated_at")
+
+  org         Organization       @relation(fields: [orgId], references: [id])
+  assignments DeviceAssignment[]
+
+  @@unique([orgId, email])
+  @@index([orgId])
+  @@map("employees")
+}
+
+// ---------------------------------------------------------------------------
+// Devices
+// ---------------------------------------------------------------------------
+
+model Device {
+  id           String       @id @default(cuid())
+  orgId        String       @map("org_id")
+  serial       String
+  type         DeviceType
+  model        String
+  purchaseDate DateTime?    @map("purchase_date")
+  notes        String?
+  status       DeviceStatus @default(active)
+  tokenHash    String?      @map("token_hash") // bcrypt hash of check-in token; null until generated
+  hostname     String?
+  lastSeen     DateTime?    @map("last_seen")
+  createdAt    DateTime     @default(now()) @map("created_at")
+  updatedAt    DateTime     @updatedAt     @map("updated_at")
+
+  org         Organization       @relation(fields: [orgId], references: [id])
+  assignments DeviceAssignment[]
+  alerts      Alert[]
+
+  @@unique([orgId, serial])
+  @@index([orgId])
+  @@index([serial])   // check-in endpoint queries by serial alone (no orgId)
+  @@index([lastSeen])
+  @@map("devices")
+}
+
+// ---------------------------------------------------------------------------
+// Device assignments — one open row per device (returned_at IS NULL = active)
+// ---------------------------------------------------------------------------
+
+model DeviceAssignment {
+  id                   String    @id @default(cuid())
+  deviceId             String    @map("device_id")
+  employeeId           String    @map("employee_id")
+  assignedAt           DateTime  @default(now()) @map("assigned_at")
+  returnedAt           DateTime? @map("returned_at")
+  conditionNotes       String?   @map("condition_notes")
+  acknowledgedAt       DateTime? @map("acknowledged_at")
+  acknowledgeToken     String?   @unique @map("acknowledge_token")
+  acknowledgeExpiresAt DateTime? @map("acknowledge_expires_at")
+  createdAt            DateTime  @default(now()) @map("created_at")
+  updatedAt            DateTime  @updatedAt     @map("updated_at")
+
+  device   Device   @relation(fields: [deviceId], references: [id])
+  employee Employee @relation(fields: [employeeId], references: [id])
+
+  @@index([deviceId])
+  @@index([employeeId])
+  @@index([acknowledgeToken])
+  @@map("device_assignments")
+}
+
+// ---------------------------------------------------------------------------
+// Alerts
+// ---------------------------------------------------------------------------
+
+model Alert {
+  id         String    @id @default(cuid())
+  deviceId   String    @map("device_id")
+  type       AlertType
+  message    String
+  sentAt     DateTime  @default(now()) @map("sent_at")
+  resolvedAt DateTime? @map("resolved_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  device Device @relation(fields: [deviceId], references: [id])
+
+  @@unique([deviceId, type, resolvedAt]) // dedup: one open alert per device per type
+  @@index([deviceId])
+  @@map("alerts")
+}
+
+// ---------------------------------------------------------------------------
+// Audit log — append-only, never updated or deleted
+// ---------------------------------------------------------------------------
+
+model AuditLog {
+  id           String   @id @default(cuid())
+  orgId        String   @map("org_id")
+  userId       String?  @map("user_id") // null for system actions (jobs)
+  action       String   // e.g. device.created, device.assigned
+  resourceType String   @map("resource_type") // device | employee | assignment
+  resourceId   String   @map("resource_id")
+  payload      Json     @default("{}")
+  ts           DateTime @default(now())
+
+  org  Organization @relation(fields: [orgId], references: [id])
+  user User?        @relation(fields: [userId], references: [id])
+
+  @@index([orgId, ts])
+  @@index([resourceType, resourceId])
+  @@map("audit_logs")
+}
