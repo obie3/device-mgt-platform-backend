@@ -1,10 +1,10 @@
 FROM node:20-alpine AS builder
 WORKDIR /app
 COPY package.json yarn.lock ./
-RUN yarn install
+RUN yarn install --frozen-lockfile
 COPY . .
-RUN yarn run db:generate
-RUN yarn run build
+RUN yarn db:generate
+RUN yarn build
 
 FROM node:20-alpine AS runner
 WORKDIR /app
@@ -15,9 +15,8 @@ RUN addgroup -g 1001 -S appgroup && \
     adduser  -u 1001 -S appuser -G appgroup
 
 COPY package.json yarn.lock ./
-RUN yarn install --production
-
-COPY --from=builder /app/dist            ./dist
+RUN yarn install --frozen-lockfile --production
+COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/node_modules/.prisma ./node_modules/.prisma
 COPY prisma ./prisma
 
