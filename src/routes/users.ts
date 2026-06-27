@@ -5,26 +5,32 @@ import { requireRole } from '../middleware/rbac.js';
 import { hashPassword, revokeAllUserTokens } from '../services/auth.service.js';
 import { logAudit } from '../services/audit.service.js';
 
+// Password rule: 8–128 chars. Upper bound prevents bcrypt DoS (bcrypt silently
+// truncates at 72 bytes but still processes the full string before truncation).
+const passwordField = z.string().min(8).max(128);
+
 const createUserBody = z.object({
-  name: z.string().min(1),
-  email: z.string().email(),
-  password: z.string().min(8),
+  name: z.string().min(1).max(200),
+  email: z.string().email().max(320),
+  password: passwordField,
   role: z.nativeEnum(UserRole).default(UserRole.viewer),
 });
 
 const updateUserBody = z.object({
-  name: z.string().min(1).optional(),
+  name: z.string().min(1).max(200).optional(),
   role: z.nativeEnum(UserRole).optional(),
   isActive: z.boolean().optional(),
-  password: z.string().min(8).optional(),
+  password: passwordField.optional(),
 });
 
 export default async function userRoutes(fastify: FastifyInstance) {
-  const auth = [fastify.authenticate];
-  const adminOnly = [fastify.authenticate, requireRole('admin')];
+  // GET /users restricted to operator+ — viewer role should not enumerate
+  // all platform accounts in the org.
+  const operatorOnly = [fastify.authenticate, requireRole('operator')];
+  const adminOnly    = [fastify.authenticate, requireRole('admin')];
 
-  // GET /api/v1/users
-  fastify.get('/users', { preHandler: auth }, async (request, reply) => {
+  // GET /api/v1/users — operator+ only
+  fastify.get('/users', { preHandler: operatorOnly }, async (request, reply) => {
     const { orgId } = request.user;
     const users = await fastify.prisma.user.findMany({
       where: { orgId },
@@ -51,9 +57,13 @@ export default async function userRoutes(fastify: FastifyInstance) {
     const { orgId, sub: actorId } = request.user;
     const { name, email, password, role } = parsed.data;
 
-    const existing = await fastify.prisma.user.findUnique({ where: { email } });
+    // Check uniqueness within this org only — email may legitimately belong to
+    // a user in another org (the schema now enforces @@unique([orgId, email])).
+    const existing = await fastify.prisma.user.findFirst({
+      where: { email, orgId },
+    });
     if (existing) {
-      return reply.status(409).send({ error: 'Email already in use' });
+      return reply.status(409).send({ error: 'Email already in use within this organisation' });
     }
 
     const passwordHash = await hashPassword(password);

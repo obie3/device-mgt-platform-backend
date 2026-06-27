@@ -84,29 +84,6 @@ export async function sendAssignmentAckEmail(opts: {
   });
 }
 
-export async function sendStaleDeviceAlert(opts: {
-  itEmail: string;
-  deviceModel: string;
-  deviceSerial: string;
-  lastSeen: Date | null;
-  staleThresholdDays: number;
-}) {
-  const lastSeenStr = opts.lastSeen
-    ? opts.lastSeen.toISOString()
-    : 'never checked in';
-
-  const message = `🔴 Stale device alert: ${opts.deviceModel} (${opts.deviceSerial}) has not checked in since ${lastSeenStr} (threshold: ${opts.staleThresholdDays} days)`;
-
-  await Promise.all([
-    sendEmail({
-      to: opts.itEmail,
-      subject: `Stale device: ${opts.deviceModel} (${opts.deviceSerial})`,
-      html: `<p>${message}</p>`,
-    }),
-    sendSlack(message),
-  ]);
-}
-
 export async function sendUnassignedDeviceAlert(opts: {
   itEmail: string;
   deviceModel: string;

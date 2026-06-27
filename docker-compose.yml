@@ -4,15 +4,15 @@ services:
     container_name: dmp-postgres
     restart: unless-stopped
     environment:
-      POSTGRES_USER: dmp
-      POSTGRES_PASSWORD: dmp_secret
-      POSTGRES_DB: dmp
+      POSTGRES_USER: ${POSTGRES_USER:-dmp}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      POSTGRES_DB: ${POSTGRES_DB:-dmp}
     ports:
       - '5433:5432'
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ['CMD-SHELL', 'pg_isready -U dmp -d dmp']
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-dmp} -d ${POSTGRES_DB:-dmp}']
       interval: 10s
       timeout: 5s
       retries: 5
@@ -26,10 +26,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    environment:
-      DATABASE_URL: postgresql://dmp:dmp_secret@postgres:5432/dmp
-      PORT: 3001
-      NODE_ENV: production
+    # All runtime config comes from env_file only — no hardcoded values here.
     env_file:
       - .env
     ports:

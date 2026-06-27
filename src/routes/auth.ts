@@ -8,10 +8,15 @@ import {
   resetPassword,
 } from '../services/auth.service.js';
 import { sendPasswordResetEmail } from '../services/notification.service.js';
+import { logAudit } from '../services/audit.service.js';
+
+// ─── Shared password rule (8–128 chars) applied everywhere a password is set ─
+
+const passwordField = z.string().min(8).max(128);
 
 const loginBody = z.object({
   email: z.string().email(),
-  password: z.string().min(1),
+  password: z.string().min(1).max(128),
 });
 
 const refreshBody = z.object({
@@ -24,43 +29,64 @@ const forgotPasswordBody = z.object({
 
 const resetPasswordBody = z.object({
   token: z.string().min(1),
-  password: z.string().min(8),
+  password: passwordField,
 });
 
 export default async function authRoutes(fastify: FastifyInstance) {
   // POST /api/v1/auth/login
-  fastify.post('/auth/login', async (request, reply) => {
-    const parsed = loginBody.safeParse(request.body);
-    if (!parsed.success) {
-      return reply.status(400).send({ error: 'Invalid request body' });
-    }
+  // Tighter rate limit than the global 100/min: 10 attempts per minute per IP.
+  fastify.post(
+    '/auth/login',
+    { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } },
+    async (request, reply) => {
+      const parsed = loginBody.safeParse(request.body);
+      if (!parsed.success) {
+        return reply.status(400).send({ error: 'Invalid request body' });
+      }
 
-    const result = await loginUser(
-      fastify.prisma,
-      parsed.data.email,
-      parsed.data.password
-    );
+      const result = await loginUser(
+        fastify.prisma,
+        parsed.data.email,
+        parsed.data.password
+      );
 
-    if (!result) {
-      return reply.status(401).send({ error: 'Invalid email or password' });
-    }
+      if (!result) {
+        // Log failed login attempt — important for detecting brute-force post-mortem.
+        // We don't have orgId here (unknown email), so log against a sentinel resource.
+        fastify.log.warn(
+          { email: parsed.data.email, ip: request.ip },
+          'Failed login attempt'
+        );
+        return reply.status(401).send({ error: 'Invalid email or password' });
+      }
 
-    const { accessToken, refreshToken, user } = result;
+      const { accessToken, refreshToken, user } = result;
 
-    return reply.send({
-      accessToken,
-      refreshToken,
-      user: {
-        id: user.id,
-        name: user.name,
-        email: user.email,
-        role: user.role,
+      await logAudit(fastify.prisma, {
         orgId: user.orgId,
-      },
-    });
-  });
+        userId: user.id,
+        action: 'user.login',
+        resourceType: 'user',
+        resourceId: user.id,
+        payload: { ip: request.ip },
+      });
+
+      return reply.send({
+        accessToken,
+        refreshToken,
+        user: {
+          id: user.id,
+          name: user.name,
+          email: user.email,
+          role: user.role,
+          orgId: user.orgId,
+        },
+      });
+    }
+  );
 
   // POST /api/v1/auth/refresh
+  // Returns both a new access token AND a new (rotated) refresh token.
   fastify.post('/auth/refresh', async (request, reply) => {
     const parsed = refreshBody.safeParse(request.body);
     if (!parsed.success) {
@@ -76,7 +102,10 @@ export default async function authRoutes(fastify: FastifyInstance) {
       return reply.status(401).send({ error: 'Invalid or expired refresh token' });
     }
 
-    return reply.send({ accessToken: result.accessToken });
+    return reply.send({
+      accessToken: result.accessToken,
+      refreshToken: result.refreshToken,
+    });
   });
 
   // POST /api/v1/auth/logout
@@ -96,55 +125,73 @@ export default async function authRoutes(fastify: FastifyInstance) {
   );
 
   // POST /api/v1/auth/forgot-password
-  fastify.post('/auth/forgot-password', async (request, reply) => {
-    const parsed = forgotPasswordBody.safeParse(request.body);
-    if (!parsed.success) {
-      return reply.status(400).send({ error: 'Invalid request body' });
-    }
+  // 3 requests per 15 minutes per IP — prevents email spam.
+  fastify.post(
+    '/auth/forgot-password',
+    { config: { rateLimit: { max: 3, timeWindow: '15 minutes' } } },
+    async (request, reply) => {
+      const parsed = forgotPasswordBody.safeParse(request.body);
+      if (!parsed.success) {
+        return reply.status(400).send({ error: 'Invalid request body' });
+      }
 
-    const result = await requestPasswordReset(fastify.prisma, parsed.data.email);
-    if (result) {
-      sendPasswordResetEmail({
-        toEmail: result.user.email,
-        resetToken: result.plainToken,
-      }).catch((err) =>
-        fastify.log.error({ err }, 'Failed to send password reset email')
-      );
-    }
+      const result = await requestPasswordReset(fastify.prisma, parsed.data.email);
+      if (result) {
+        sendPasswordResetEmail({
+          toEmail: result.user.email,
+          resetToken: result.plainToken,
+        }).catch((err) =>
+          fastify.log.error({ err }, 'Failed to send password reset email')
+        );
 
-    // Always return a generic response so we don't leak which emails are registered
-    return reply.send({
-      ok: true,
-      message: 'If that email is registered, a reset link has been sent.',
-    });
-  });
+        await logAudit(fastify.prisma, {
+          orgId: result.user.orgId,
+          userId: result.user.id,
+          action: 'user.password_reset_requested',
+          resourceType: 'user',
+          resourceId: result.user.id,
+          payload: { ip: request.ip },
+        });
+      }
+
+      // Always return a generic response so we don't leak which emails are registered.
+      return reply.send({
+        ok: true,
+        message: 'If that email is registered, a reset link has been sent.',
+      });
+    }
+  );
 
   // POST /api/v1/auth/reset-password
-  fastify.post('/auth/reset-password', async (request, reply) => {
-    const parsed = resetPasswordBody.safeParse(request.body);
-    if (!parsed.success) {
-      return reply.status(400).send({ error: 'Invalid request body' });
+  fastify.post(
+    '/auth/reset-password',
+    { config: { rateLimit: { max: 5, timeWindow: '15 minutes' } } },
+    async (request, reply) => {
+      const parsed = resetPasswordBody.safeParse(request.body);
+      if (!parsed.success) {
+        return reply.status(400).send({ error: parsed.error.flatten() });
+      }
+
+      const success = await resetPassword(
+        fastify.prisma,
+        parsed.data.token,
+        parsed.data.password
+      );
+
+      if (!success) {
+        return reply.status(400).send({ error: 'Invalid or expired reset token' });
+      }
+
+      return reply.send({ ok: true });
     }
-
-    const success = await resetPassword(
-      fastify.prisma,
-      parsed.data.token,
-      parsed.data.password
-    );
-
-    if (!success) {
-      return reply.status(400).send({ error: 'Invalid or expired reset token' });
-    }
-
-    return reply.send({ ok: true });
-  });
+  );
 
   // GET /api/v1/auth/me
   fastify.get(
     '/auth/me',
     { preHandler: [fastify.authenticate] },
     async (request, reply) => {
-      const user = await fastify.prisma.user.findUnique({
+      const user = await fastify.prisma.user.findFirst({
         where: { id: request.user.sub },
         select: {
           id: true,

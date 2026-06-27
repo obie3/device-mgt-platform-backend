@@ -37,7 +37,6 @@ enum EmployeeStatus {
 }
 
 enum AlertType {
-  stale_device
   unassigned_device
 }
 
@@ -47,8 +46,7 @@ enum AlertType {
 
 model Organization {
   id                  String   @id @default(cuid())
-  name                String
-  staleThresholdDays  Int      @default(14) @map("stale_threshold_days")
+  name                String   @db.VarChar(200)
   unassignedAlertDays Int      @default(7)  @map("unassigned_alert_days")
   settings            Json     @default("{}")
   createdAt           DateTime @default(now()) @map("created_at")
@@ -64,13 +62,16 @@ model Organization {
 
 // ---------------------------------------------------------------------------
 // Users — platform login accounts (email + password, no OIDC)
+// Email is unique per org. Login resolves by email across orgs (first match
+// for the given credentials wins — acceptable since email domains are
+// typically org-scoped in practice).
 // ---------------------------------------------------------------------------
 
 model User {
   id           String   @id @default(cuid())
   orgId        String   @map("org_id")
-  name         String
-  email        String   @unique
+  name         String   @db.VarChar(200)
+  email        String   @db.VarChar(320)
   passwordHash String   @map("password_hash")
   role         UserRole @default(viewer)
   isActive     Boolean  @default(true) @map("is_active")
@@ -82,6 +83,7 @@ model User {
   passwordResetTokens PasswordResetToken[]
   auditLogs           AuditLog[]
 
+  @@unique([orgId, email])
   @@index([orgId])
   @@map("users")
 }
@@ -129,9 +131,9 @@ model PasswordResetToken {
 model Employee {
   id         String         @id @default(cuid())
   orgId      String         @map("org_id")
-  name       String
-  email      String
-  department String?
+  name       String         @db.VarChar(200)
+  email      String         @db.VarChar(320)
+  department String?        @db.VarChar(100)
   status     EmployeeStatus @default(active)
   createdAt  DateTime       @default(now()) @map("created_at")
   updatedAt  DateTime       @updatedAt     @map("updated_at")
@@ -145,21 +147,18 @@ model Employee {
 }
 
 // ---------------------------------------------------------------------------
-// Devices
+// Devices — no check-in fields (tokenHash / hostname / lastSeen removed)
 // ---------------------------------------------------------------------------
 
 model Device {
   id           String       @id @default(cuid())
   orgId        String       @map("org_id")
-  serial       String
+  serial       String       @db.VarChar(100)
   type         DeviceType
-  model        String
+  model        String       @db.VarChar(200)
   purchaseDate DateTime?    @map("purchase_date")
-  notes        String?
+  notes        String?      @db.VarChar(2000)
   status       DeviceStatus @default(active)
-  tokenHash    String?      @map("token_hash") // bcrypt hash of check-in token; null until generated
-  hostname     String?
-  lastSeen     DateTime?    @map("last_seen")
   createdAt    DateTime     @default(now()) @map("created_at")
   updatedAt    DateTime     @updatedAt     @map("updated_at")
 
@@ -169,8 +168,6 @@ model Device {
 
   @@unique([orgId, serial])
   @@index([orgId])
-  @@index([serial])   // check-in endpoint queries by serial alone (no orgId)
-  @@index([lastSeen])
   @@map("devices")
 }
 
@@ -184,7 +181,7 @@ model DeviceAssignment {
   employeeId           String    @map("employee_id")
   assignedAt           DateTime  @default(now()) @map("assigned_at")
   returnedAt           DateTime? @map("returned_at")
-  conditionNotes       String?   @map("condition_notes")
+  conditionNotes       String?   @map("condition_notes") @db.VarChar(2000)
   acknowledgedAt       DateTime? @map("acknowledged_at")
   acknowledgeToken     String?   @unique @map("acknowledge_token")
   acknowledgeExpiresAt DateTime? @map("acknowledge_expires_at")
@@ -208,7 +205,7 @@ model Alert {
   id         String    @id @default(cuid())
   deviceId   String    @map("device_id")
   type       AlertType
-  message    String
+  message    String    @db.VarChar(500)
   sentAt     DateTime  @default(now()) @map("sent_at")
   resolvedAt DateTime? @map("resolved_at")
   createdAt  DateTime  @default(now()) @map("created_at")
@@ -228,8 +225,8 @@ model AuditLog {
   id           String   @id @default(cuid())
   orgId        String   @map("org_id")
   userId       String?  @map("user_id") // null for system actions (jobs)
-  action       String   // e.g. device.created, device.assigned
-  resourceType String   @map("resource_type") // device | employee | assignment
+  action       String   @db.VarChar(100) // e.g. device.created, user.login
+  resourceType String   @map("resource_type") @db.VarChar(50)
   resourceId   String   @map("resource_id")
   payload      Json     @default("{}")
   ts           DateTime @default(now())

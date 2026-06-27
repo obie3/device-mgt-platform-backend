@@ -12,7 +12,18 @@ const envSchema = z.object({
   JWT_ACCESS_EXPIRES_IN: z.string().default('15m'),
   JWT_REFRESH_EXPIRES_IN: z.string().default('7d'),
 
-  CORS_ORIGIN: z.string().default('http://localhost:3000'),
+  // In production, CORS_ORIGIN must be an explicit https:// domain — not a
+  // wildcard or localhost. This prevents accidental misconfiguration.
+  CORS_ORIGIN: z.string().default('http://localhost:3000').superRefine((val, ctx) => {
+    if (process.env.NODE_ENV !== 'production') return;
+    if (val === '*' || val.includes('localhost') || val.startsWith('http://')) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          'CORS_ORIGIN must be an explicit https:// domain in production (not localhost, http://, or *).',
+      });
+    }
+  }),
 
   SMTP_HOST: z.string().optional(),
   SMTP_PORT: z.coerce.number().default(587),

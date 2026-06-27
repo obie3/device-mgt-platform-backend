@@ -1,5 +1,6 @@
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
+import helmet from '@fastify/helmet';
 import multipart from '@fastify/multipart';
 import rateLimit from '@fastify/rate-limit';
 
@@ -24,14 +25,35 @@ export async function buildApp() {
           ? { target: 'pino-pretty' }
           : undefined,
     },
+    // Explicit body size cap (default is 1MB but we set it explicitly so it's
+    // not silently changed by a Fastify upgrade). Prevents memory exhaustion
+    // from oversized JSON payloads.
+    bodyLimit: 1_048_576, // 1 MB
   });
 
-  // Plugins
+  // Security headers — must be registered before routes so the headers are set
+  // on every response including error responses.
+  await fastify.register(helmet, {
+    // Content-Security-Policy is intentionally relaxed for an API-only server.
+    // The frontend (served separately) sets its own CSP. We still include
+    // the header to prevent downstream proxies from injecting scripts if this
+    // endpoint is ever accidentally served as HTML.
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'none'"],
+        frameAncestors: ["'none'"],
+      },
+    },
+    crossOriginEmbedderPolicy: false, // not needed for a pure API
+  });
+
   await fastify.register(cors, {
     origin: config.CORS_ORIGIN,
     credentials: true,
   });
 
+  // Global rate limit — individual auth routes add tighter per-route limits
+  // on top of this (see routes/auth.ts).
   await fastify.register(rateLimit, {
     max: 100,
     timeWindow: '1 minute',

@@ -35,8 +35,6 @@ export default async function reportRoutes(fastify: FastifyInstance) {
           model: d.model,
           status: d.status,
           purchaseDate: d.purchaseDate?.toISOString() ?? '',
-          lastSeen: d.lastSeen?.toISOString() ?? '',
-          hostname: d.hostname ?? '',
           assigneeName: assignment?.employee.name ?? '',
           assigneeEmail: assignment?.employee.email ?? '',
           assigneeDepartment: assignment?.employee.department ?? '',

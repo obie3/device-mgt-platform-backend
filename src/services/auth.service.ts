@@ -22,21 +22,33 @@ export interface RefreshTokenPayload {
 }
 
 export function signAccessToken(payload: Omit<AccessTokenPayload, 'type'>) {
+  // Cast required: @types/jsonwebtoken@9 tightened expiresIn to StringValue (branded
+  // type from ms). Config values are valid ms strings at runtime but typed as string.
   return jwt.sign({ ...payload, type: 'access' }, config.JWT_ACCESS_SECRET, {
     expiresIn: config.JWT_ACCESS_EXPIRES_IN,
-  });
+  } as jwt.SignOptions);
 }
 
 export function signRefreshToken(userId: string, jti: string) {
   return jwt.sign(
     { sub: userId, jti, type: 'refresh' },
     config.JWT_REFRESH_SECRET,
-    { expiresIn: config.JWT_REFRESH_EXPIRES_IN }
+    { expiresIn: config.JWT_REFRESH_EXPIRES_IN } as jwt.SignOptions
   );
 }
 
+/**
+ * Verifies a refresh token JWT. Throws if invalid signature or expired.
+ * Also validates the `type` claim at runtime — a cast alone is insufficient
+ * because if both secrets were accidentally identical an access token could
+ * pass signature verification.
+ */
 export function verifyRefreshToken(token: string): RefreshTokenPayload {
-  return jwt.verify(token, config.JWT_REFRESH_SECRET) as RefreshTokenPayload;
+  const payload = jwt.verify(token, config.JWT_REFRESH_SECRET) as RefreshTokenPayload;
+  if (payload.type !== 'refresh') {
+    throw new Error('Token type mismatch: expected refresh');
+  }
+  return payload;
 }
 
 function hashToken(token: string) {
@@ -68,11 +80,15 @@ export async function loginUser(
   email: string,
   password: string
 ) {
-  const user = await prisma.user.findUnique({ where: { email } });
+  // Email is now unique per-org. For login we find the first active account
+  // matching the email — in practice org email domains are distinct so
+  // collisions are rare; the first-created account wins.
+  const user = await prisma.user.findFirst({
+    where: { email, isActive: true },
+    orderBy: { createdAt: 'asc' },
+  });
 
-  if (!user || !user.isActive) {
-    return null;
-  }
+  if (!user) return null;
 
   const valid = await bcrypt.compare(password, user.passwordHash);
   if (!valid) return null;
@@ -98,6 +114,14 @@ export async function loginUser(
   return { accessToken, refreshToken, user };
 }
 
+/**
+ * Rotates the refresh token on every use:
+ * - Old token is revoked immediately
+ * - New refresh token is issued and persisted
+ * Returns both new access and refresh tokens.
+ * This makes stolen refresh tokens detectable: the legitimate holder's next
+ * refresh will fail because the token was already rotated by the attacker.
+ */
 export async function refreshAccessToken(
   prisma: PrismaClient,
   refreshToken: string
@@ -119,13 +143,31 @@ export async function refreshAccessToken(
   const user = await prisma.user.findUnique({ where: { id: payload.sub } });
   if (!user || !user.isActive) return null;
 
+  // Rotate: revoke old token, issue new one in a transaction
+  const newJti = crypto.randomUUID();
+  const newRefreshToken = signRefreshToken(user.id, newJti);
+
+  await prisma.$transaction([
+    prisma.refreshToken.update({
+      where: { id: stored.id },
+      data: { revokedAt: new Date() },
+    }),
+    prisma.refreshToken.create({
+      data: {
+        userId: user.id,
+        tokenHash: hashToken(newRefreshToken),
+        expiresAt: refreshExpiresAt(),
+      },
+    }),
+  ]);
+
   const accessToken = signAccessToken({
     sub: user.id,
     orgId: user.orgId,
     role: user.role,
   });
 
-  return { accessToken, user };
+  return { accessToken, refreshToken: newRefreshToken, user };
 }
 
 export async function revokeRefreshToken(
@@ -162,17 +204,29 @@ export async function hashPassword(password: string) {
 const RESET_TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hour
 
 export async function requestPasswordReset(prisma: PrismaClient, email: string) {
-  const user = await prisma.user.findUnique({ where: { email } });
-  if (!user || !user.isActive) return null;
+  const user = await prisma.user.findFirst({
+    where: { email, isActive: true },
+    orderBy: { createdAt: 'asc' },
+  });
+  if (!user) return null;
 
   const plainToken = crypto.randomBytes(32).toString('hex');
-  await prisma.passwordResetToken.create({
-    data: {
-      userId: user.id,
-      tokenHash: hashToken(plainToken),
-      expiresAt: new Date(Date.now() + RESET_TOKEN_TTL_MS),
-    },
-  });
+
+  // Revoke all outstanding reset tokens before issuing a new one.
+  // Prevents an attacker from using an intercepted older token after
+  // the user has already requested a fresh one.
+  await prisma.$transaction([
+    prisma.passwordResetToken.deleteMany({
+      where: { userId: user.id, usedAt: null },
+    }),
+    prisma.passwordResetToken.create({
+      data: {
+        userId: user.id,
+        tokenHash: hashToken(plainToken),
+        expiresAt: new Date(Date.now() + RESET_TOKEN_TTL_MS),
+      },
+    }),
+  ]);
 
   return { user, plainToken };
 }

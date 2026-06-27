@@ -1,4 +1,4 @@
-import { PrismaClient } from '@prisma/client';
+import { PrismaClient, Prisma } from '@prisma/client';
 
 interface LogParams {
   orgId: string;
@@ -17,7 +17,8 @@ export async function logAudit(prisma: PrismaClient, params: LogParams) {
       action: params.action,
       resourceType: params.resourceType,
       resourceId: params.resourceId,
-      payload: params.payload ?? {},
+      // Prisma Json field requires InputJsonValue, not Record<string, unknown>
+      payload: (params.payload ?? {}) as Prisma.InputJsonValue,
     },
   });
 }
