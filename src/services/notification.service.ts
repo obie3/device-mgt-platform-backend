@@ -18,6 +18,10 @@ function getTransporter() {
       port: config.SMTP_PORT,
       secure: config.SMTP_SECURE,
       auth: { user: config.SMTP_USER, pass: config.SMTP_PASS },
+      // Fail fast — prevents unreachable SMTP from hanging for the OS default 20s TCP timeout
+      connectionTimeout: 5_000,
+      greetingTimeout: 5_000,
+      socketTimeout: 10_000,
     });
   }
   return transporter;

@@ -7,7 +7,12 @@ import { runUnassignedDeviceJob } from './unassigned-device.job.js';
 let boss: PgBoss | null = null;
 
 export async function startScheduler(prisma: PrismaClient) {
-  boss = new PgBoss(config.DATABASE_URL);
+  boss = new PgBoss({
+    connectionString: config.DATABASE_URL,
+    // Reduce maintenance polling frequency — default is every 2s per worker
+    // which adds constant DB queries. These are daily cron jobs, 30s resolution is fine.
+    monitorStateIntervalSeconds: 30,
+  });
 
   boss.on('error', (error) => {
     console.error('[pg-boss] error:', error);
@@ -15,21 +20,24 @@ export async function startScheduler(prisma: PrismaClient) {
 
   await boss.start();
 
+  // Poll every 60s — these are daily cron jobs, sub-minute latency is unnecessary
+  const workerOpts = { pollingIntervalSeconds: 60 };
+
   // Schedule: stale device check daily at 08:00
   await boss.schedule('stale-device-check', '0 8 * * *');
-  await boss.work('stale-device-check', async () => {
+  await boss.work('stale-device-check', workerOpts, async () => {
     await runStaleDeviceJob(prisma);
   });
 
   // Schedule: unassigned device check daily at 08:05
   await boss.schedule('unassigned-device-check', '5 8 * * *');
-  await boss.work('unassigned-device-check', async () => {
+  await boss.work('unassigned-device-check', workerOpts, async () => {
     await runUnassignedDeviceJob(prisma);
   });
 
   // Cleanup expired refresh tokens weekly
   await boss.schedule('cleanup-refresh-tokens', '0 3 * * 0');
-  await boss.work('cleanup-refresh-tokens', async () => {
+  await boss.work('cleanup-refresh-tokens', workerOpts, async () => {
     await prisma.refreshToken.deleteMany({
       where: { expiresAt: { lt: new Date() } },
     });

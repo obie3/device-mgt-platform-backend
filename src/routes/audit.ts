@@ -52,8 +52,75 @@ export default async function auditRoutes(fastify: FastifyInstance) {
         fastify.prisma.auditLog.count({ where }),
       ]);
 
+      // ── Batch-resolve resource names ────────────────────────────────────────
+      const deviceIds   = [...new Set(logs.filter(l => l.resourceType === 'device').map(l => l.resourceId))];
+      const employeeIds = [...new Set(logs.filter(l => l.resourceType === 'employee').map(l => l.resourceId))];
+      const userIds     = [...new Set(logs.filter(l => l.resourceType === 'user').map(l => l.resourceId))];
+
+      // For device.assigned entries, extract employeeIds from the payload so we
+      // can resolve the assignee name without a separate round-trip.
+      const assignPayloadEmpIds = [
+        ...new Set(
+          logs
+            .filter(l => l.action === 'device.assigned')
+            .map(l => (l.payload as Record<string, unknown>).employeeId as string | undefined)
+            .filter((id): id is string => !!id)
+        ),
+      ];
+
+      const [devices, employees, platformUsers, assignees] = await Promise.all([
+        deviceIds.length
+          ? fastify.prisma.device.findMany({
+              where: { id: { in: deviceIds } },
+              select: { id: true, model: true, serial: true },
+            })
+          : [],
+        employeeIds.length
+          ? fastify.prisma.employee.findMany({
+              where: { id: { in: employeeIds } },
+              select: { id: true, name: true, email: true },
+            })
+          : [],
+        userIds.length
+          ? fastify.prisma.user.findMany({
+              where: { id: { in: userIds } },
+              select: { id: true, name: true, email: true },
+            })
+          : [],
+        assignPayloadEmpIds.length
+          ? fastify.prisma.employee.findMany({
+              where: { id: { in: assignPayloadEmpIds } },
+              select: { id: true, name: true, email: true },
+            })
+          : [],
+      ]);
+
+      const deviceMap   = new Map(devices.map(d => [d.id, d]));
+      const employeeMap = new Map(employees.map(e => [e.id, e]));
+      const userMap     = new Map(platformUsers.map(u => [u.id, u]));
+      const assigneeMap = new Map(assignees.map(e => [e.id, e]));
+
+      function resourceName(log: (typeof logs)[number]): string | null {
+        switch (log.resourceType) {
+          case 'device':   return deviceMap.get(log.resourceId)?.model ?? null;
+          case 'employee': return employeeMap.get(log.resourceId)?.name ?? null;
+          case 'user':     return userMap.get(log.resourceId)?.name ?? null;
+          default:         return null;
+        }
+      }
+
+      function assignee(log: (typeof logs)[number]) {
+        if (log.action !== 'device.assigned') return null;
+        const empId = (log.payload as Record<string, unknown>).employeeId as string | undefined;
+        return empId ? (assigneeMap.get(empId) ?? null) : null;
+      }
+
       return reply.send({
-        data: logs,
+        data: logs.map(log => ({
+          ...log,
+          resourceName: resourceName(log),
+          assignee: assignee(log),
+        })),
         total,
         page,
         limit,
