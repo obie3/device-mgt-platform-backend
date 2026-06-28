@@ -31,7 +31,9 @@ enum DeviceType {
 }
 
 enum DeviceStatus {
-  active
+  in_stock      // received, not yet assigned
+  assigned      // currently held by an employee
+  under_repair  // sent for maintenance / repair
   decommissioned
 }
 
@@ -161,12 +163,33 @@ model Device {
   type         DeviceType
   manufacturer String?      @db.VarChar(100)
   model        String       @db.VarChar(200)
-  purchaseDate DateTime?    @map("purchase_date")
-  notes                String?      @db.VarChar(2000)
-  status               DeviceStatus @default(active)
-  decommissionReason   String?      @db.VarChar(1000) @map("decommission_reason")
-  createdAt            DateTime     @default(now()) @map("created_at")
-  updatedAt    DateTime     @updatedAt     @map("updated_at")
+  status       DeviceStatus @default(in_stock)
+
+  // Asset identification
+  assetTag     String?      @db.VarChar(50)   @map("asset_tag")
+  // @@unique([orgId, assetTag]) — enforced via partial index in migration SQL
+  // (WHERE asset_tag IS NOT NULL) so multiple devices can have no asset tag.
+
+  // Location & ownership
+  location     String?      @db.VarChar(200)
+  department   String?      @db.VarChar(100)
+
+  // Procurement
+  purchaseDate  DateTime?   @map("purchase_date")
+  supplier      String?     @db.VarChar(200)
+  purchasePrice Decimal?    @db.Decimal(10, 2) @map("purchase_price")
+
+  // Warranty
+  warrantyStart    DateTime? @map("warranty_start")
+  warrantyEnd      DateTime? @map("warranty_end")
+  warrantyProvider String?   @db.VarChar(200)  @map("warranty_provider")
+
+  // Lifecycle
+  decommissionReason String?  @db.VarChar(1000) @map("decommission_reason")
+  notes              String?  @db.VarChar(2000)
+
+  createdAt    DateTime     @default(now()) @map("created_at")
+  updatedAt    DateTime     @updatedAt      @map("updated_at")
 
   org         Organization       @relation(fields: [orgId], references: [id])
   assignments DeviceAssignment[]
@@ -175,6 +198,8 @@ model Device {
 
   @@unique([orgId, serial])
   @@index([orgId])
+  @@index([orgId, status])
+  @@index([warrantyEnd])
   @@map("devices")
 }
 
