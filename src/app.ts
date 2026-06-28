@@ -3,6 +3,9 @@ import cors from '@fastify/cors';
 import helmet from '@fastify/helmet';
 import multipart from '@fastify/multipart';
 import rateLimit from '@fastify/rate-limit';
+import staticFiles from '@fastify/static';
+import path from 'path';
+import fs from 'fs';
 
 import prismaPlugin from './plugins/prisma.js';
 import authPlugin from './plugins/auth.js';
@@ -61,6 +64,18 @@ export async function buildApp() {
 
   await fastify.register(multipart, {
     limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB
+  });
+
+  // Serve uploaded device images as static files.
+  // The directory is created on startup if it doesn't exist.
+  const uploadDir = path.resolve(config.UPLOAD_DIR);
+  fs.mkdirSync(uploadDir, { recursive: true });
+  await fastify.register(staticFiles, {
+    root: uploadDir,
+    prefix: '/uploads/',
+    // Do not index directories
+    list: false,
+    decorateReply: false,
   });
 
   await fastify.register(prismaPlugin);

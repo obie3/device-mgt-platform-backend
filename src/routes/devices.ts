@@ -2,24 +2,46 @@ import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { DeviceStatus, DeviceType } from '@prisma/client';
 import crypto from 'crypto';
+import path from 'path';
+import fs from 'fs';
+import { pipeline } from 'stream/promises';
+import { createWriteStream } from 'fs';
 import { requireRole } from '../middleware/rbac.js';
 import { logAudit } from '../services/audit.service.js';
 import { sendAssignmentAckEmail } from '../services/notification.service.js';
+import { config } from '../config.js';
+
+const MAX_IMAGE_SIZE   = 3 * 1024 * 1024; // 3 MB
+const MAX_IMAGES       = 5;
+const ALLOWED_MIMETYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
 
 const createDeviceBody = z.object({
-  serial: z.string().min(1).max(100),
-  type: z.nativeEnum(DeviceType),
-  model: z.string().min(1).max(200),
+  serial:       z.string().min(1).max(100),
+  type:         z.nativeEnum(DeviceType),
+  manufacturer: z.string().max(100).optional(),
+  model:        z.string().min(1).max(200),
   purchaseDate: z.string().optional(),
-  notes: z.string().max(2000).optional(),
+  notes:        z.string().max(2000).optional(),
 });
 
-const updateDeviceBody = z.object({
-  model: z.string().min(1).max(200).optional(),
-  notes: z.string().max(2000).optional(),
-  status: z.nativeEnum(DeviceStatus).optional(),
-  purchaseDate: z.string().optional(),
-});
+const updateDeviceBody = z
+  .object({
+    manufacturer:        z.string().max(100).optional(),
+    model:               z.string().min(1).max(200).optional(),
+    notes:               z.string().max(2000).optional(),
+    status:              z.nativeEnum(DeviceStatus).optional(),
+    purchaseDate:        z.string().optional(),
+    decommissionReason:  z.string().min(1).max(1000).optional(),
+  })
+  .superRefine((val, ctx) => {
+    if (val.status === 'decommissioned' && !val.decommissionReason?.trim()) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['decommissionReason'],
+        message: 'Reason for decommissioning is required',
+      });
+    }
+  });
 
 const assignBody = z.object({
   employeeId: z.string(),
@@ -114,6 +136,7 @@ export default async function deviceRoutes(fastify: FastifyInstance) {
         orgId,
         serial:       parsed.data.serial,
         type:         parsed.data.type,
+        manufacturer: parsed.data.manufacturer,
         model:        parsed.data.model,
         purchaseDate: parsed.data.purchaseDate ? new Date(parsed.data.purchaseDate) : undefined,
         notes:        parsed.data.notes,
@@ -145,7 +168,8 @@ export default async function deviceRoutes(fastify: FastifyInstance) {
             orderBy: { assignedAt: 'asc' },
             include: { employee: { select: { id: true, name: true, email: true } } },
           },
-          alerts: { where: { resolvedAt: null }, orderBy: { sentAt: 'desc' } },
+          alerts:  { where: { resolvedAt: null }, orderBy: { sentAt: 'desc' } },
+          images:  { orderBy: { createdAt: 'asc' } },
         },
       }),
       fastify.prisma.auditLog.findMany({
@@ -164,7 +188,9 @@ export default async function deviceRoutes(fastify: FastifyInstance) {
 
     // Attach assignedBy to each assignment by correlating with audit log in order
     const assignAuditEntries = auditEntries.filter((e) => e.action === 'device.assigned');
-    const assignmentsWithActor = device.assignments.map((a, i) => ({
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const rawAssignments: any[] = (device as any).assignments ?? [];
+    const assignmentsWithActor = rawAssignments.map((a, i) => ({
       ...a,
       assignedBy: assignAuditEntries[i]?.user ?? null,
     }));
@@ -175,7 +201,7 @@ export default async function deviceRoutes(fastify: FastifyInstance) {
       ...device,
       createdBy:         createdEntry?.user ?? null,
       assignments:       assignmentsWithActor,
-      currentAssignment: assignmentsWithActor.find((a) => a.returnedAt === null) ?? null,
+      currentAssignment: assignmentsWithActor.find((a: { returnedAt: unknown }) => a.returnedAt === null) ?? null,
     });
   });
 
@@ -196,7 +222,9 @@ export default async function deviceRoutes(fastify: FastifyInstance) {
       where: { id },
       data: {
         ...parsed.data,
-        purchaseDate: parsed.data.purchaseDate ? new Date(parsed.data.purchaseDate) : undefined,
+        purchaseDate:       parsed.data.purchaseDate ? new Date(parsed.data.purchaseDate) : undefined,
+        // Clear reason when re-activating a previously decommissioned device
+        decommissionReason: parsed.data.status === 'active' ? null : parsed.data.decommissionReason,
       },
     });
 
@@ -326,4 +354,145 @@ export default async function deviceRoutes(fastify: FastifyInstance) {
 
     return reply.status(200).send({ ok: true });
   });
+
+  // ── POST /api/v1/devices/:id/images ───────────────────────────────────────
+  // Accepts multipart/form-data with one or more files in the "images" field.
+  // Each file must be ≤ 3 MB and be an image type. Up to MAX_IMAGES total.
+  fastify.post('/devices/:id/images', { preHandler: operator }, async (request, reply) => {
+    const { id: deviceId }       = request.params as { id: string };
+    const { orgId, sub: userId } = request.user;
+
+    const device = await fastify.prisma.device.findFirst({
+      where: { id: deviceId, orgId },
+      include: { _count: { select: { images: true } } },
+    });
+    if (!device) return reply.status(404).send({ error: 'Device not found' });
+
+    const existing = (device as typeof device & { _count: { images: number } })._count.images;
+    if (existing >= MAX_IMAGES) {
+      return reply.status(409).send({
+        error: `Device already has the maximum of ${MAX_IMAGES} images`,
+      });
+    }
+
+    const uploadDir = path.resolve(config.UPLOAD_DIR);
+    fs.mkdirSync(uploadDir, { recursive: true });
+
+    const parts = request.parts();
+    const saved: Array<{ filename: string; originalName: string; size: number; mimeType: string }> = [];
+    let remaining = MAX_IMAGES - existing;
+
+    for await (const part of parts) {
+      if (part.type !== 'file') continue;
+      if (remaining <= 0) break;
+
+      const mimeType = part.mimetype;
+      if (!ALLOWED_MIMETYPES.has(mimeType)) {
+        await part.file.resume(); // drain the stream
+        return reply.status(400).send({
+          error: `Unsupported file type: ${mimeType}. Allowed: JPEG, PNG, WebP, GIF`,
+        });
+      }
+
+      // Read into buffer to validate size before writing to disk
+      const chunks: Buffer[] = [];
+      let totalSize = 0;
+      for await (const chunk of part.file) {
+        totalSize += chunk.length;
+        if (totalSize > MAX_IMAGE_SIZE) {
+          return reply.status(413).send({
+            error: `File "${part.filename}" exceeds the 3 MB limit`,
+          });
+        }
+        chunks.push(chunk as Buffer);
+      }
+
+      const ext        = path.extname(part.filename || '').toLowerCase() || '.jpg';
+      const storedName = `${crypto.randomUUID()}${ext}`;
+      const destPath   = path.join(uploadDir, storedName);
+
+      await fs.promises.writeFile(destPath, Buffer.concat(chunks));
+
+      saved.push({
+        filename:     storedName,
+        originalName: part.filename ?? 'image',
+        size:         totalSize,
+        mimeType,
+      });
+      remaining--;
+    }
+
+    if (saved.length === 0) {
+      return reply.status(400).send({ error: 'No valid image files received' });
+    }
+
+    const images = await fastify.prisma.$transaction(
+      saved.map((s) =>
+        fastify.prisma.deviceImage.create({
+          data: { deviceId, ...s },
+        })
+      )
+    );
+
+    await logAudit(fastify.prisma, {
+      orgId, userId,
+      action: 'device.images_uploaded',
+      resourceType: 'device',
+      resourceId: deviceId,
+      payload: { count: images.length },
+    });
+
+    return reply.status(201).send(images);
+  });
+
+  // ── GET /api/v1/devices/:id/images ────────────────────────────────────────
+  fastify.get('/devices/:id/images', { preHandler: auth }, async (request, reply) => {
+    const { id: deviceId } = request.params as { id: string };
+    const { orgId }        = request.user;
+
+    const device = await fastify.prisma.device.findFirst({ where: { id: deviceId, orgId } });
+    if (!device) return reply.status(404).send({ error: 'Device not found' });
+
+    const images = await fastify.prisma.deviceImage.findMany({
+      where: { deviceId },
+      orderBy: { createdAt: 'asc' },
+    });
+
+    return reply.send(images);
+  });
+
+  // ── DELETE /api/v1/devices/:id/images/:imageId ────────────────────────────
+  fastify.delete(
+    '/devices/:id/images/:imageId',
+    { preHandler: operator },
+    async (request, reply) => {
+      const { id: deviceId, imageId } = request.params as { id: string; imageId: string };
+      const { orgId, sub: userId }    = request.user;
+
+      const device = await fastify.prisma.device.findFirst({ where: { id: deviceId, orgId } });
+      if (!device) return reply.status(404).send({ error: 'Device not found' });
+
+      const image = await fastify.prisma.deviceImage.findFirst({
+        where: { id: imageId, deviceId },
+      });
+      if (!image) return reply.status(404).send({ error: 'Image not found' });
+
+      // Delete DB record first, then file — if file delete fails the record is already gone
+      // which is acceptable. The reverse (file gone but record remains) would expose dead links.
+      await fastify.prisma.deviceImage.delete({ where: { id: imageId } });
+
+      const filePath = path.join(path.resolve(config.UPLOAD_DIR), image.filename);
+      fs.unlink(filePath, () => {}); // best-effort
+
+      await logAudit(fastify.prisma, {
+        orgId, userId,
+        action: 'device.image_deleted',
+        resourceType: 'device',
+        resourceId: deviceId,
+        payload: { imageId, filename: image.originalName },
+      });
+
+      return reply.status(204).send();
+    }
+  );
 }

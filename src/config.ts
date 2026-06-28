@@ -34,6 +34,10 @@ const envSchema = z.object({
 
   APP_BASE_URL: z.string().default('http://localhost:3000'),
 
+  // Directory where device images are stored. Must be writable by the API process.
+  // In Docker this should be a mounted volume so images survive container restarts.
+  UPLOAD_DIR: z.string().default('./uploads/device-images'),
+
   SLACK_WEBHOOK_URL: z.string().optional(),
 
   SEED_ADMIN_EMAIL: z.string().email().optional(),

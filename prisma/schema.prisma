@@ -20,14 +20,18 @@ enum UserRole {
 
 enum DeviceType {
   laptop
+  desktop
   mobile
   tablet
+  server
+  monitor
+  printer
+  networking
   other
 }
 
 enum DeviceStatus {
   active
-  inactive
   decommissioned
 }
 
@@ -155,20 +159,42 @@ model Device {
   orgId        String       @map("org_id")
   serial       String       @db.VarChar(100)
   type         DeviceType
+  manufacturer String?      @db.VarChar(100)
   model        String       @db.VarChar(200)
   purchaseDate DateTime?    @map("purchase_date")
-  notes        String?      @db.VarChar(2000)
-  status       DeviceStatus @default(active)
-  createdAt    DateTime     @default(now()) @map("created_at")
+  notes                String?      @db.VarChar(2000)
+  status               DeviceStatus @default(active)
+  decommissionReason   String?      @db.VarChar(1000) @map("decommission_reason")
+  createdAt            DateTime     @default(now()) @map("created_at")
   updatedAt    DateTime     @updatedAt     @map("updated_at")
 
   org         Organization       @relation(fields: [orgId], references: [id])
   assignments DeviceAssignment[]
   alerts      Alert[]
+  images      DeviceImage[]
 
   @@unique([orgId, serial])
   @@index([orgId])
   @@map("devices")
+}
+
+// ---------------------------------------------------------------------------
+// Device images — up to 5 images per device, stored on the filesystem
+// ---------------------------------------------------------------------------
+
+model DeviceImage {
+  id           String   @id @default(cuid())
+  deviceId     String   @map("device_id")
+  filename     String   @db.VarChar(200)  // stored name on disk (UUID-based)
+  originalName String   @db.VarChar(500)  @map("original_name")
+  size         Int                         // bytes
+  mimeType     String   @db.VarChar(50)   @map("mime_type")
+  createdAt    DateTime @default(now())   @map("created_at")
+
+  device Device @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@index([deviceId])
+  @@map("device_images")
 }
 
 // ---------------------------------------------------------------------------

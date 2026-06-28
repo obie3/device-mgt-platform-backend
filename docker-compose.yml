@@ -31,6 +31,9 @@ services:
       - .env
     ports:
       - '3001:3001'
+    volumes:
+      # Persist device images across container restarts
+      - device_images:/app/uploads/device-images
 
   web:
     build:
@@ -45,3 +48,4 @@ services:
 
 volumes:
   postgres_data:
+  device_images:
