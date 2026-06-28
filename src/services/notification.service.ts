@@ -1,43 +1,21 @@
-import nodemailer from 'nodemailer';
-import { config } from '../config.js';
+import { createEmailProvider } from './email/index.js';
+import type { EmailProvider }  from './email/index.js';
+import { config }              from '../config.js';
 
 // ---------------------------------------------------------------------------
-// Mailer
+// Emailer — module-level singleton
 // ---------------------------------------------------------------------------
+// Initialised once at module load.  null when SMTP is not configured — all
+// sendEmail calls below log and return rather than throwing.
 
-let transporter: nodemailer.Transporter | null = null;
+const emailer: EmailProvider | null = createEmailProvider(config);
 
-function getTransporter() {
-  if (!transporter) {
-    if (!config.SMTP_HOST || !config.SMTP_USER) {
-      // No SMTP configured — log only
-      return null;
-    }
-    transporter = nodemailer.createTransport({
-      host: config.SMTP_HOST,
-      port: config.SMTP_PORT,
-      secure: config.SMTP_SECURE,
-      auth: { user: config.SMTP_USER, pass: config.SMTP_PASS },
-      // Fail fast — prevents unreachable SMTP from hanging for the OS default 20s TCP timeout
-      connectionTimeout: 5_000,
-      greetingTimeout: 5_000,
-      socketTimeout: 10_000,
-    });
-  }
-  return transporter;
-}
-
-export async function sendEmail(opts: {
-  to: string;
-  subject: string;
-  html: string;
-}) {
-  const t = getTransporter();
-  if (!t) {
+async function sendEmail(opts: { to: string; subject: string; html: string }) {
+  if (!emailer) {
     console.log(`[email:no-smtp] To: ${opts.to} | Subject: ${opts.subject}`);
     return;
   }
-  await t.sendMail({ from: config.EMAIL_FROM, ...opts });
+  await emailer.send({ to: opts.to, subject: opts.subject, html: opts.html });
 }
 
 // ---------------------------------------------------------------------------
@@ -47,9 +25,9 @@ export async function sendEmail(opts: {
 export async function sendSlack(text: string) {
   if (!config.SLACK_WEBHOOK_URL) return;
   await fetch(config.SLACK_WEBHOOK_URL, {
-    method: 'POST',
+    method:  'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text }),
+    body:    JSON.stringify({ text }),
   });
 }
 
@@ -58,16 +36,16 @@ export async function sendSlack(text: string) {
 // ---------------------------------------------------------------------------
 
 export async function sendAssignmentAckEmail(opts: {
-  assigneeEmail: string;
-  assigneeName: string;
-  deviceModel: string;
-  deviceSerial: string;
+  assigneeEmail:  string;
+  assigneeName:   string;
+  deviceModel:    string;
+  deviceSerial:   string;
   conditionNotes: string | null;
-  ackToken: string;
+  ackToken:       string;
 }) {
   const ackUrl = `${config.APP_BASE_URL}/ack/${opts.ackToken}`;
   await sendEmail({
-    to: opts.assigneeEmail,
+    to:      opts.assigneeEmail,
     subject: `Please acknowledge receipt of ${opts.deviceModel}`,
     html: `
       <p>Hi ${opts.assigneeName},</p>
@@ -85,31 +63,31 @@ export async function sendAssignmentAckEmail(opts: {
 }
 
 export async function sendUnassignedDeviceAlert(opts: {
-  itEmail: string;
-  deviceModel: string;
-  deviceSerial: string;
+  itEmail:         string;
+  deviceModel:     string;
+  deviceSerial:    string;
   unassignedSince: Date;
-  thresholdDays: number;
+  thresholdDays:   number;
 }) {
   const message = `⚠️ Unassigned device: ${opts.deviceModel} (${opts.deviceSerial}) has been unassigned since ${opts.unassignedSince.toISOString()} (threshold: ${opts.thresholdDays} days)`;
 
   await Promise.all([
     sendEmail({
-      to: opts.itEmail,
+      to:      opts.itEmail,
       subject: `Unassigned device: ${opts.deviceModel} (${opts.deviceSerial})`,
-      html: `<p>${message}</p>`,
+      html:    `<p>${message}</p>`,
     }),
     sendSlack(message),
   ]);
 }
 
 export async function sendPasswordResetEmail(opts: {
-  toEmail: string;
+  toEmail:    string;
   resetToken: string;
 }) {
   const resetUrl = `${config.APP_BASE_URL}/reset-password/${opts.resetToken}`;
   await sendEmail({
-    to: opts.toEmail,
+    to:      opts.toEmail,
     subject: 'Reset your password',
     html: `
       <p>We received a request to reset your password.</p>
@@ -121,16 +99,16 @@ export async function sendPasswordResetEmail(opts: {
 }
 
 export async function sendOffboardingAlert(opts: {
-  itEmail: string;
+  itEmail:      string;
   employeeName: string;
-  devices: Array<{ model: string; serial: string }>;
+  devices:      Array<{ model: string; serial: string }>;
 }) {
   const deviceList = opts.devices
     .map((d) => `<li>${d.model} — ${d.serial}</li>`)
     .join('');
 
   await sendEmail({
-    to: opts.itEmail,
+    to:      opts.itEmail,
     subject: `Offboarding: ${opts.employeeName} has assigned devices`,
     html: `
       <p>${opts.employeeName} has been offboarded. Please recover the following devices:</p>

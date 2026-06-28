@@ -7,8 +7,10 @@ import staticFiles from '@fastify/static';
 import path from 'path';
 import fs from 'fs';
 
-import prismaPlugin from './plugins/prisma.js';
-import authPlugin from './plugins/auth.js';
+import prismaPlugin  from './plugins/prisma.js';
+import authPlugin    from './plugins/auth.js';
+import storagePlugin from './plugins/storage.js';
+import emailerPlugin from './plugins/emailer.js';
 import { config } from './config.js';
 
 import authRoutes from './routes/auth.js';
@@ -79,6 +81,8 @@ export async function buildApp() {
   });
 
   await fastify.register(prismaPlugin);
+  await fastify.register(storagePlugin);
+  await fastify.register(emailerPlugin);
   await fastify.register(authPlugin);
 
   // Health check — no auth required

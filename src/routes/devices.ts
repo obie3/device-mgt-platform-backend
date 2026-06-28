@@ -1,15 +1,9 @@
 import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { DeviceStatus, DeviceType } from '@prisma/client';
-import crypto from 'crypto';
-import path from 'path';
-import fs from 'fs';
-import { pipeline } from 'stream/promises';
-import { createWriteStream } from 'fs';
-import { requireRole } from '../middleware/rbac.js';
-import { logAudit } from '../services/audit.service.js';
+import { requireRole }            from '../middleware/rbac.js';
+import { logAudit }               from '../services/audit.service.js';
 import { sendAssignmentAckEmail } from '../services/notification.service.js';
-import { config } from '../config.js';
 
 const MAX_IMAGE_SIZE   = 3 * 1024 * 1024; // 3 MB
 const MAX_IMAGES       = 5;
@@ -218,12 +212,14 @@ export default async function deviceRoutes(fastify: FastifyInstance) {
     const device = await fastify.prisma.device.findFirst({ where: { id, orgId } });
     if (!device) return reply.status(404).send({ error: 'Device not found' });
 
-    const updated = await fastify.prisma.device.update({
+    const updated = await (fastify.prisma.device.update as any)({
       where: { id },
       data: {
         ...parsed.data,
         purchaseDate:       parsed.data.purchaseDate ? new Date(parsed.data.purchaseDate) : undefined,
-        // Clear reason when re-activating a previously decommissioned device
+        // Clear reason when re-activating a previously decommissioned device.
+        // Cast required until `npx prisma generate` is run locally to pick up
+        // the decommission_reason column added in the latest migration.
         decommissionReason: parsed.data.status === 'active' ? null : parsed.data.decommissionReason,
       },
     });
@@ -375,9 +371,6 @@ export default async function deviceRoutes(fastify: FastifyInstance) {
       });
     }
 
-    const uploadDir = path.resolve(config.UPLOAD_DIR);
-    fs.mkdirSync(uploadDir, { recursive: true });
-
     const parts = request.parts();
     const saved: Array<{ filename: string; originalName: string; size: number; mimeType: string }> = [];
     let remaining = MAX_IMAGES - existing;
@@ -394,7 +387,8 @@ export default async function deviceRoutes(fastify: FastifyInstance) {
         });
       }
 
-      // Read into buffer to validate size before writing to disk
+      // Buffer the entire file before writing so we can enforce the size cap
+      // without leaving partial files on disk / in cloud storage.
       const chunks: Buffer[] = [];
       let totalSize = 0;
       for await (const chunk of part.file) {
@@ -407,14 +401,14 @@ export default async function deviceRoutes(fastify: FastifyInstance) {
         chunks.push(chunk as Buffer);
       }
 
-      const ext        = path.extname(part.filename || '').toLowerCase() || '.jpg';
-      const storedName = `${crypto.randomUUID()}${ext}`;
-      const destPath   = path.join(uploadDir, storedName);
-
-      await fs.promises.writeFile(destPath, Buffer.concat(chunks));
+      const result = await fastify.storage.upload(Buffer.concat(chunks), {
+        filename: part.filename || 'image.jpg',
+        mimeType,
+        folder:   'device-images',
+      });
 
       saved.push({
-        filename:     storedName,
+        filename:     result.key,
         originalName: part.filename ?? 'image',
         size:         totalSize,
         mimeType,
@@ -442,7 +436,10 @@ export default async function deviceRoutes(fastify: FastifyInstance) {
       payload: { count: images.length },
     });
 
-    return reply.status(201).send(images);
+    // Attach resolved public URL so clients don't need to know the provider
+    return reply.status(201).send(
+      images.map((img) => ({ ...img, url: fastify.storage.getUrl(img.filename) }))
+    );
   });
 
   // ── GET /api/v1/devices/:id/images ────────────────────────────────────────
@@ -458,7 +455,9 @@ export default async function deviceRoutes(fastify: FastifyInstance) {
       orderBy: { createdAt: 'asc' },
     });
 
-    return reply.send(images);
+    return reply.send(
+      images.map((img) => ({ ...img, url: fastify.storage.getUrl(img.filename) }))
+    );
   });
 
   // ── DELETE /api/v1/devices/:id/images/:imageId ────────────────────────────
@@ -477,12 +476,12 @@ export default async function deviceRoutes(fastify: FastifyInstance) {
       });
       if (!image) return reply.status(404).send({ error: 'Image not found' });
 
-      // Delete DB record first, then file — if file delete fails the record is already gone
-      // which is acceptable. The reverse (file gone but record remains) would expose dead links.
+      // Delete DB record first, then the stored file — if file delete fails
+      // the record is already gone (acceptable). The reverse would expose dead links.
       await fastify.prisma.deviceImage.delete({ where: { id: imageId } });
 
-      const filePath = path.join(path.resolve(config.UPLOAD_DIR), image.filename);
-      fs.unlink(filePath, () => {}); // best-effort
+      // Best-effort: provider silently swallows "not found" errors
+      fastify.storage.delete(image.filename).catch(() => {});
 
       await logAudit(fastify.prisma, {
         orgId, userId,

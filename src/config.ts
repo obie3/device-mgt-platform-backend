@@ -34,9 +34,35 @@ const envSchema = z.object({
 
   APP_BASE_URL: z.string().default('http://localhost:3000'),
 
-  // Directory where device images are stored. Must be writable by the API process.
-  // In Docker this should be a mounted volume so images survive container restarts.
+  // ---------------------------------------------------------------------------
+  // Storage provider
+  // ---------------------------------------------------------------------------
+  // 'local'       — write files to UPLOAD_DIR (default, dev-friendly)
+  // 's3'          — AWS S3 or any S3-compatible store (R2, MinIO)
+  // 'cloudinary'  — Cloudinary media platform
+  STORAGE_PROVIDER: z.enum(['local', 's3', 'cloudinary']).default('local'),
+
+  // Directory where device images are stored (local provider only).
+  // Must be writable by the API process. In Docker, mount this as a named
+  // volume so images survive container restarts.
   UPLOAD_DIR: z.string().default('./uploads/device-images'),
+
+  // S3 / S3-compatible (required when STORAGE_PROVIDER=s3)
+  S3_BUCKET:            z.string().optional(),
+  S3_REGION:            z.string().optional(),
+  S3_ACCESS_KEY_ID:     z.string().optional(),
+  S3_SECRET_ACCESS_KEY: z.string().optional(),
+  /** Custom endpoint for Cloudflare R2 / MinIO (omit for standard AWS) */
+  S3_ENDPOINT:          z.string().optional(),
+  /** Base URL for public object access — no trailing slash.
+   *  AWS:     https://<bucket>.s3.<region>.amazonaws.com
+   *  R2/CDN:  https://cdn.example.com */
+  S3_PUBLIC_BASE_URL:   z.string().optional(),
+
+  // Cloudinary (required when STORAGE_PROVIDER=cloudinary)
+  CLOUDINARY_CLOUD_NAME: z.string().optional(),
+  CLOUDINARY_API_KEY:    z.string().optional(),
+  CLOUDINARY_API_SECRET: z.string().optional(),
 
   SLACK_WEBHOOK_URL: z.string().optional(),
 
