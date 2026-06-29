@@ -13,23 +13,23 @@ async function main() {
     where: { id: 'seed-org' },
     update: {},
     create: {
-      id: 'seed-org',
-      name: orgName,
-      staleThresholdDays: 14,
+      id:                  'seed-org',
+      name:                orgName,
+      unassignedAlertDays: 7,
     },
   });
 
   // Upsert admin user
   const passwordHash = await bcrypt.hash(adminPassword, 12);
   const user = await prisma.user.upsert({
-    where: { email: adminEmail },
+    where: { orgId_email: { orgId: org.id, email: adminEmail } },
     update: {},
     create: {
-      orgId: org.id,
-      name: 'Admin',
-      email: adminEmail,
+      orgId:        org.id,
+      name:         'Admin',
+      email:        adminEmail,
       passwordHash,
-      role: UserRole.admin,
+      role:         UserRole.admin,
     },
   });
 
