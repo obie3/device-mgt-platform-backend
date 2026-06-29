@@ -6,9 +6,12 @@ import {
   revokeRefreshToken,
   requestPasswordReset,
   resetPassword,
+  hashPassword,
+  revokeAllUserTokens,
 } from '../services/auth.service.js';
 import { sendPasswordResetEmail } from '../services/notification.service.js';
 import { logAudit } from '../services/audit.service.js';
+import bcrypt from 'bcryptjs';
 
 // ─── Shared password rule (8–128 chars) applied everywhere a password is set ─
 
@@ -207,6 +210,109 @@ export default async function authRoutes(fastify: FastifyInstance) {
       if (!user) return reply.status(404).send({ error: 'User not found' });
 
       return reply.send(user);
+    }
+  );
+
+  // PATCH /api/v1/auth/me — update own name / email
+  const updateMeBody = z.object({
+    name:  z.string().min(1).max(200).optional(),
+    email: z.string().email().max(320).optional(),
+  }).refine((d) => d.name !== undefined || d.email !== undefined, {
+    message: 'At least one field (name or email) must be provided',
+  });
+
+  fastify.patch(
+    '/auth/me',
+    { preHandler: [fastify.authenticate] },
+    async (request, reply) => {
+      const { sub: userId, orgId } = request.user;
+
+      const parsed = updateMeBody.safeParse(request.body);
+      if (!parsed.success) {
+        return reply.status(400).send({ error: parsed.error.flatten() });
+      }
+
+      // If changing email, check it isn't already taken in this org
+      if (parsed.data.email) {
+        const existing = await fastify.prisma.user.findFirst({
+          where: { orgId, email: parsed.data.email, NOT: { id: userId } },
+        });
+        if (existing) {
+          return reply.status(409).send({ error: 'Email already in use' });
+        }
+      }
+
+      const updated = await fastify.prisma.user.update({
+        where: { id: userId },
+        data:  parsed.data,
+        select: { id: true, name: true, email: true, role: true, orgId: true, isActive: true, createdAt: true },
+      });
+
+      await logAudit(fastify.prisma, {
+        orgId,
+        userId,
+        action: 'user.updated_profile',
+        resourceType: 'user',
+        resourceId: userId,
+        payload: { fields: Object.keys(parsed.data) },
+      });
+
+      return reply.send(updated);
+    }
+  );
+
+  // POST /api/v1/auth/change-password
+  const changePasswordBody = z.object({
+    currentPassword: z.string().min(1).max(128),
+    newPassword:     passwordField,
+  });
+
+  fastify.post(
+    '/auth/change-password',
+    {
+      preHandler: [fastify.authenticate],
+      config: { rateLimit: { max: 10, timeWindow: '1 minute' } },
+    },
+    async (request, reply) => {
+      const { sub: userId, orgId } = request.user;
+
+      const parsed = changePasswordBody.safeParse(request.body);
+      if (!parsed.success) {
+        return reply.status(400).send({ error: parsed.error.flatten() });
+      }
+
+      const user = await fastify.prisma.user.findUnique({ where: { id: userId } });
+      if (!user) return reply.status(404).send({ error: 'User not found' });
+
+      const valid = await bcrypt.compare(parsed.data.currentPassword, user.passwordHash);
+      if (!valid) {
+        return reply.status(400).send({ error: 'Current password is incorrect' });
+      }
+
+      if (parsed.data.currentPassword === parsed.data.newPassword) {
+        return reply.status(400).send({ error: 'New password must differ from current password' });
+      }
+
+      const passwordHash = await hashPassword(parsed.data.newPassword);
+
+      await fastify.prisma.user.update({
+        where: { id: userId },
+        data:  { passwordHash },
+      });
+
+      // Revoke all existing sessions — user must log in again on other devices
+      await revokeAllUserTokens(fastify.prisma, userId);
+
+      await logAudit(fastify.prisma, {
+        orgId,
+        userId,
+        action: 'user.changed_password',
+        resourceType: 'user',
+        resourceId: userId,
+        payload: {},
+      });
+
+      return reply.send({ ok: true });
     }
   );
 }
