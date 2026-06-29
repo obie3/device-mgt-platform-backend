@@ -30,7 +30,7 @@ export async function runUnassignedDeviceJob(prisma: PrismaClient) {
     const candidates = await prisma.device.findMany({
       where: {
         orgId: org.id,
-        status: 'active',
+        status: 'in_stock', // Phase 1: 'active' was renamed to 'in_stock'
         assignments: {
           none: { returnedAt: null }, // no active assignment
         },

@@ -81,6 +81,27 @@ export async function sendUnassignedDeviceAlert(opts: {
   ]);
 }
 
+export async function sendWarrantyExpiryAlert(opts: {
+  itEmail:      string;
+  deviceModel:  string;
+  deviceSerial: string;
+  warrantyEnd:  Date;
+  isExpired:    boolean;
+}) {
+  const dateStr = opts.warrantyEnd.toISOString().slice(0, 10);
+  const subject = opts.isExpired
+    ? `Warranty expired: ${opts.deviceModel} (${opts.deviceSerial})`
+    : `Warranty expiring soon: ${opts.deviceModel} (${opts.deviceSerial})`;
+  const body = opts.isExpired
+    ? `⚠️ Warranty expired: ${opts.deviceModel} (${opts.deviceSerial}) — warranty ended on ${dateStr}. Consider renewing or planning for replacement.`
+    : `⏰ Warranty expiring soon: ${opts.deviceModel} (${opts.deviceSerial}) — warranty ends on ${dateStr}. Take action before coverage lapses.`;
+
+  await Promise.all([
+    sendEmail({ to: opts.itEmail, subject, html: `<p>${body}</p>` }),
+    sendSlack(body),
+  ]);
+}
+
 export async function sendPasswordResetEmail(opts: {
   toEmail:    string;
   resetToken: string;
@@ -96,6 +117,62 @@ export async function sendPasswordResetEmail(opts: {
       <p>This link expires in 1 hour. If you didn't request this, you can ignore this email.</p>
     `,
   });
+}
+
+export async function sendApprovalRequestedEmail(opts: {
+  adminEmails:   string[];
+  requesterName: string;
+  type:          'assignment' | 'decommission' | 'offboard';
+  deviceModel?:  string;
+  deviceSerial?: string;
+  employeeName?: string;
+}) {
+  const actionLabel =
+    opts.type === 'assignment'
+      ? `assign device ${opts.deviceModel} (${opts.deviceSerial}) to ${opts.employeeName}`
+      : opts.type === 'decommission'
+      ? `decommission device ${opts.deviceModel} (${opts.deviceSerial})`
+      : `offboard employee ${opts.employeeName}`;
+
+  const subject = `Approval needed: ${opts.requesterName} wants to ${actionLabel}`;
+  const html = `
+    <p><strong>${opts.requesterName}</strong> has submitted a request to ${actionLabel}.</p>
+    <p>Please log in to the Device Management Platform to approve or reject this request.</p>
+  `;
+
+  await Promise.all(
+    opts.adminEmails.map((email) => sendEmail({ to: email, subject, html }))
+  );
+  await sendSlack(`⏳ Approval needed: ${opts.requesterName} wants to ${actionLabel}`);
+}
+
+export async function sendApprovalResolvedEmail(opts: {
+  requesterEmail: string;
+  requesterName:  string;
+  type:           'assignment' | 'decommission' | 'offboard';
+  approved:       boolean;
+  deviceModel?:   string;
+  deviceSerial?:  string;
+  employeeName?:  string;
+  reviewNote?:    string;
+}) {
+  const actionLabel =
+    opts.type === 'assignment'
+      ? `assign device ${opts.deviceModel} (${opts.deviceSerial})`
+      : opts.type === 'decommission'
+      ? `decommission device ${opts.deviceModel} (${opts.deviceSerial})`
+      : `offboard employee ${opts.employeeName}`;
+
+  const verdict = opts.approved ? 'approved ✅' : 'rejected ❌';
+  const subject = `Your request to ${actionLabel} was ${opts.approved ? 'approved' : 'rejected'}`;
+  const html = `
+    <p>Hi ${opts.requesterName},</p>
+    <p>Your request to <strong>${actionLabel}</strong> has been <strong>${verdict}</strong>.</p>
+    ${opts.reviewNote ? `<p><strong>Note:</strong> ${opts.reviewNote}</p>` : ''}
+    <p>Please log in to the Device Management Platform for more details.</p>
+  `;
+
+  await sendEmail({ to: opts.requesterEmail, subject, html });
 }
 
 export async function sendOffboardingAlert(opts: {

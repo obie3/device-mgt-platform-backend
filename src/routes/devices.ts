@@ -1,9 +1,12 @@
 import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { DeviceStatus, DeviceType } from '@prisma/client';
+import { DeviceStatus, DeviceType, Prisma } from '@prisma/client';
 import { requireRole }            from '../middleware/rbac.js';
 import { logAudit }               from '../services/audit.service.js';
-import { sendAssignmentAckEmail } from '../services/notification.service.js';
+import {
+  sendAssignmentAckEmail,
+  sendApprovalRequestedEmail,
+} from '../services/notification.service.js';
 
 const MAX_IMAGE_SIZE   = 3 * 1024 * 1024; // 3 MB
 const MAX_IMAGES       = 5;
@@ -13,14 +16,12 @@ const ALLOWED_MIMETYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'ima
 // Status state machine — enforced in the PATCH route.
 // assigned → in_stock is NOT allowed directly; must go through /unassign.
 // ---------------------------------------------------------------------------
-// Cast all enum values to `string` to work around the stale Prisma client
-// (generated before the DeviceStatus enum was expanded).
-// Run `npx prisma generate` after migrating to remove these casts.
-const VALID_TRANSITIONS: Record<string, string[]> = {
-  in_stock:      ['assigned', 'under_repair', 'decommissioned'],
-  assigned:      ['under_repair', 'decommissioned'],
-  under_repair:  ['in_stock', 'decommissioned'],
-  decommissioned: [],
+const VALID_TRANSITIONS: Record<DeviceStatus, DeviceStatus[]> = {
+  in_stock:       ['assigned', 'under_repair', 'decommissioned'],
+  assigned:       ['under_repair', 'decommissioned'],
+  under_repair:   ['in_stock', 'decommissioned'],
+  // Admins can reactivate a decommissioned device; enforced below
+  decommissioned: ['in_stock', 'under_repair'],
 };
 
 // ---------------------------------------------------------------------------
@@ -45,8 +46,10 @@ const sharedDeviceFields = {
   manufacturer:    z.string().max(100).optional(),
   model:           z.string().min(1).max(200).optional(),
   assetTag:        z.string().max(50).optional(),
-  location:        z.string().max(200).optional(),
-  department:      z.string().max(100).optional(),
+  // Phase 3: departmentId/locationId replace the old department/location strings
+  departmentId:    z.string().nullable().optional(),
+  locationId:      z.string().nullable().optional(),
+  costCenter:      z.string().max(100).optional(),
   supplier:        z.string().max(200).optional(),
   purchaseDate:    z.string().optional(),
   purchasePrice:   z.number().nonnegative().optional(),
@@ -60,6 +63,8 @@ const createDeviceBody = z.object({
   serial: z.string().min(1).max(100),
   type:   z.nativeEnum(DeviceType),
   ...sharedDeviceFields,
+  // model is required for creates (overrides the optional in sharedDeviceFields)
+  model: z.string().min(1).max(200),
 });
 
 const updateDeviceBody = z
@@ -79,8 +84,11 @@ const updateDeviceBody = z
   });
 
 const assignBody = z.object({
-  employeeId: z.string(),
-  conditionNotes: z.string().max(2000).optional(),
+  employeeId:      z.string(),
+  conditionNotes:  z.string().max(2000).optional(),
+  /** When true: look up employee.department by name in the org's departments
+   *  and set device.departmentId to the matched row (no-op if no match). */
+  syncDepartment:  z.boolean().optional(),
 });
 
 const listQuery = z.object({
@@ -88,6 +96,8 @@ const listQuery = z.object({
   status:           z.nativeEnum(DeviceStatus).optional(),
   assigned:         z.enum(['true', 'false']).optional(),
   search:           z.string().max(200).optional(),
+  departmentId:     z.string().optional(),
+  locationId:       z.string().optional(),
   /** Return only devices whose warranty expires within N days */
   warrantyExpiring: z.coerce.number().int().min(1).max(365).optional(),
   /** Return only devices whose warranty has already expired */
@@ -108,17 +118,20 @@ export default async function deviceRoutes(fastify: FastifyInstance) {
     }
 
     const { orgId } = request.user;
-    const { type, status, assigned, search, warrantyExpiring, warrantyExpired, page, limit } = query.data;
+    const { type, status, assigned, search, departmentId, locationId, warrantyExpiring, warrantyExpired, page, limit } = query.data;
 
-    const where: Record<string, unknown> = { orgId };
-    if (type)   where.type = type;
-    if (status) where.status = status;
+    const where: Prisma.DeviceWhereInput = { orgId };
+    if (type)         where.type         = type;
+    if (status)       where.status       = status;
+    if (departmentId) where.departmentId = departmentId;
+    if (locationId)   where.locationId   = locationId;
     if (search) {
       where.OR = [
-        { serial:   { contains: search, mode: 'insensitive' } },
-        { model:    { contains: search, mode: 'insensitive' } },
-        { assetTag: { contains: search, mode: 'insensitive' } },
-        { location: { contains: search, mode: 'insensitive' } },
+        { serial:     { contains: search, mode: 'insensitive' } },
+        { model:      { contains: search, mode: 'insensitive' } },
+        { assetTag:   { contains: search, mode: 'insensitive' } },
+        { department: { name: { contains: search, mode: 'insensitive' } } },
+        { location:   { name: { contains: search, mode: 'insensitive' } } },
       ];
     }
     if (warrantyExpired) {
@@ -135,6 +148,8 @@ export default async function deviceRoutes(fastify: FastifyInstance) {
         take: limit,
         orderBy: { createdAt: 'desc' },
         include: {
+          department: { select: { id: true, name: true } },
+          location:   { select: { id: true, name: true } },
           assignments: {
             where: { returnedAt: null },
             include: { employee: { select: { id: true, name: true, email: true } } },
@@ -154,7 +169,7 @@ export default async function deviceRoutes(fastify: FastifyInstance) {
         ...d,
         currentAssignment: d.assignments[0] ?? null,
         assignments:       undefined,
-        warrantyStatus:    warrantyStatus((d as any).warrantyEnd ?? null),
+        warrantyStatus:    warrantyStatus(d.warrantyEnd),
       })),
       total,
       page,
@@ -179,18 +194,19 @@ export default async function deviceRoutes(fastify: FastifyInstance) {
       return reply.status(409).send({ error: 'Serial number already registered' });
     }
 
-    const device = await (fastify.prisma.device.create as any)({
+    const device = await fastify.prisma.device.create({
       data: {
         orgId,
         serial:          parsed.data.serial,
         type:            parsed.data.type,
         manufacturer:    parsed.data.manufacturer,
         model:           parsed.data.model,
-        assetTag:        parsed.data.assetTag     || undefined,
-        location:        parsed.data.location     || undefined,
-        department:      parsed.data.department   || undefined,
-        supplier:        parsed.data.supplier     || undefined,
-        purchasePrice:   parsed.data.purchasePrice  != null ? parsed.data.purchasePrice : undefined,
+        assetTag:        parsed.data.assetTag      || undefined,
+        departmentId:    parsed.data.departmentId  ?? undefined,
+        locationId:      parsed.data.locationId    ?? undefined,
+        costCenter:      parsed.data.costCenter    || undefined,
+        supplier:        parsed.data.supplier      || undefined,
+        purchasePrice:   parsed.data.purchasePrice != null ? parsed.data.purchasePrice : undefined,
         purchaseDate:    parsed.data.purchaseDate  ? new Date(parsed.data.purchaseDate)  : undefined,
         warrantyStart:   parsed.data.warrantyStart ? new Date(parsed.data.warrantyStart) : undefined,
         warrantyEnd:     parsed.data.warrantyEnd   ? new Date(parsed.data.warrantyEnd)   : undefined,
@@ -219,6 +235,8 @@ export default async function deviceRoutes(fastify: FastifyInstance) {
       fastify.prisma.device.findFirst({
         where: { id, orgId },
         include: {
+          department: { select: { id: true, name: true } },
+          location:   { select: { id: true, name: true } },
           // asc so we can correlate with audit entries by index
           assignments: {
             orderBy: { assignedAt: 'asc' },
@@ -244,9 +262,7 @@ export default async function deviceRoutes(fastify: FastifyInstance) {
 
     // Attach assignedBy to each assignment by correlating with audit log in order
     const assignAuditEntries = auditEntries.filter((e) => e.action === 'device.assigned');
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const rawAssignments: any[] = (device as any).assignments ?? [];
-    const assignmentsWithActor = rawAssignments.map((a, i) => ({
+    const assignmentsWithActor = device.assignments.map((a, i) => ({
       ...a,
       assignedBy: assignAuditEntries[i]?.user ?? null,
     }));
@@ -255,21 +271,21 @@ export default async function deviceRoutes(fastify: FastifyInstance) {
 
     return reply.send({
       ...device,
-      images:            ((device as any).images ?? []).map((img: any) => ({
+      images:            device.images.map((img) => ({
         ...img,
         url: fastify.storage.getUrl(img.filename),
       })),
-      warrantyStatus:    warrantyStatus((device as any).warrantyEnd ?? null),
+      warrantyStatus:    warrantyStatus(device.warrantyEnd),
       createdBy:         createdEntry?.user ?? null,
       assignments:       assignmentsWithActor,
-      currentAssignment: assignmentsWithActor.find((a: { returnedAt: unknown }) => a.returnedAt === null) ?? null,
+      currentAssignment: assignmentsWithActor.find((a) => a.returnedAt === null) ?? null,
     });
   });
 
   // ── PATCH /api/v1/devices/:id ──────────────────────────────────────────────
   fastify.patch('/devices/:id', { preHandler: operator }, async (request, reply) => {
-    const { id }                 = request.params as { id: string };
-    const { orgId, sub: userId } = request.user;
+    const { id }                       = request.params as { id: string };
+    const { orgId, sub: userId, role } = request.user;
 
     const parsed = updateDeviceBody.safeParse(request.body);
     if (!parsed.success) {
@@ -280,32 +296,93 @@ export default async function deviceRoutes(fastify: FastifyInstance) {
     if (!device) return reply.status(404).send({ error: 'Device not found' });
 
     // Validate status transition
-    if (parsed.data.status && (parsed.data.status as string) !== (device.status as string)) {
-      const allowed = VALID_TRANSITIONS[device.status as string] ?? [];
-      if (!allowed.includes(parsed.data.status as string)) {
+    if (parsed.data.status && parsed.data.status !== device.status) {
+      const allowed = VALID_TRANSITIONS[device.status] ?? [];
+      if (!allowed.includes(parsed.data.status)) {
         return reply.status(409).send({
           error: `Cannot transition device from '${device.status}' to '${parsed.data.status}'`,
         });
       }
+      // Only admins can reactivate a decommissioned device
+      if (device.status === 'decommissioned' && role !== 'admin') {
+        return reply.status(403).send({
+          error: 'Only admins can reactivate a decommissioned device',
+        });
+      }
     }
 
-    const updated = await (fastify.prisma.device.update as any)({
+    // ── Governance gate: operators must request decommission approval ─────
+    if (parsed.data.status === 'decommissioned' && role !== 'admin') {
+      const conflict = await fastify.prisma.approval.findFirst({
+        where: { deviceId: id, orgId, status: 'pending' },
+      });
+      if (conflict) {
+        return reply.status(409).send({
+          error: 'A pending approval already exists for this device',
+        });
+      }
+
+      const [approval, requester, admins] = await Promise.all([
+        fastify.prisma.approval.create({
+          data: {
+            orgId,
+            type:        'decommission',
+            requestedBy: userId,
+            deviceId:    id,
+            payload:     { decommissionReason: parsed.data.decommissionReason },
+          },
+        }),
+        fastify.prisma.user.findUnique({
+          where:  { id: userId },
+          select: { name: true },
+        }),
+        fastify.prisma.user.findMany({
+          where:  { orgId, role: 'admin', isActive: true },
+          select: { email: true },
+        }),
+      ]);
+
+      await logAudit(fastify.prisma, {
+        orgId, userId,
+        action: 'approval.requested',
+        resourceType: 'approval',
+        resourceId: approval.id,
+        payload: { type: 'decommission', deviceId: id },
+      });
+
+      sendApprovalRequestedEmail({
+        adminEmails:   admins.map((a) => a.email),
+        requesterName: requester?.name ?? 'An operator',
+        type:          'decommission',
+        deviceModel:   device.model,
+        deviceSerial:  device.serial,
+      }).catch((err) => fastify.log.error({ err }, 'Failed to send approval request email'));
+
+      return reply.status(202).send({
+        ok: true,
+        approval,
+        message: 'Decommission request submitted for admin approval',
+      });
+    }
+    // ── Admin: execute directly (original flow) ───────────────────────────
+
+    const updated = await fastify.prisma.device.update({
       where: { id },
       data: {
         manufacturer:     parsed.data.manufacturer,
         model:            parsed.data.model,
-        assetTag:         parsed.data.assetTag         !== undefined ? (parsed.data.assetTag || null)     : undefined,
-        location:         parsed.data.location         !== undefined ? (parsed.data.location || null)     : undefined,
-        department:       parsed.data.department       !== undefined ? (parsed.data.department || null)   : undefined,
-        supplier:         parsed.data.supplier         !== undefined ? (parsed.data.supplier || null)     : undefined,
-        purchasePrice:    parsed.data.purchasePrice    != null       ? parsed.data.purchasePrice          : undefined,
+        assetTag:         parsed.data.assetTag      !== undefined ? (parsed.data.assetTag || null) : undefined,
+        departmentId:     parsed.data.departmentId  !== undefined ? parsed.data.departmentId       : undefined,
+        locationId:       parsed.data.locationId    !== undefined ? parsed.data.locationId         : undefined,
+        costCenter:       parsed.data.costCenter    !== undefined ? (parsed.data.costCenter || null) : undefined,
+        supplier:         parsed.data.supplier      !== undefined ? (parsed.data.supplier || null) : undefined,
+        purchasePrice:    parsed.data.purchasePrice != null       ? parsed.data.purchasePrice       : undefined,
         warrantyProvider: parsed.data.warrantyProvider !== undefined ? (parsed.data.warrantyProvider || null) : undefined,
-        purchaseDate:     parsed.data.purchaseDate     ? new Date(parsed.data.purchaseDate)  : undefined,
-        warrantyStart:    parsed.data.warrantyStart    ? new Date(parsed.data.warrantyStart) : undefined,
-        warrantyEnd:      parsed.data.warrantyEnd      ? new Date(parsed.data.warrantyEnd)   : undefined,
+        purchaseDate:     parsed.data.purchaseDate  ? new Date(parsed.data.purchaseDate)  : undefined,
+        warrantyStart:    parsed.data.warrantyStart ? new Date(parsed.data.warrantyStart) : undefined,
+        warrantyEnd:      parsed.data.warrantyEnd   ? new Date(parsed.data.warrantyEnd)   : undefined,
         notes:            parsed.data.notes,
         status:           parsed.data.status,
-        // Clear reason when moving out of decommissioned (not possible today — terminal — but safe)
         decommissionReason: parsed.data.status === 'decommissioned'
           ? parsed.data.decommissionReason
           : parsed.data.status != null ? null : undefined,
@@ -313,8 +390,8 @@ export default async function deviceRoutes(fastify: FastifyInstance) {
     });
 
     // Auto-close open assignment when decommissioning or sending for repair.
-    const autoCloseStatuses = ['decommissioned', 'under_repair'];
-    if (parsed.data.status && autoCloseStatuses.includes(parsed.data.status as string)) {
+    const autoCloseStatuses: DeviceStatus[] = ['decommissioned', 'under_repair'];
+    if (parsed.data.status && autoCloseStatuses.includes(parsed.data.status)) {
       const reason = parsed.data.status === 'decommissioned' ? 'device_decommissioned' : 'device_under_repair';
       const closed = await fastify.prisma.deviceAssignment.updateMany({
         where: { deviceId: id, returnedAt: null },
@@ -345,7 +422,7 @@ export default async function deviceRoutes(fastify: FastifyInstance) {
   // ── POST /api/v1/devices/:id/assign ───────────────────────────────────────
   fastify.post('/devices/:id/assign', { preHandler: operator }, async (request, reply) => {
     const { id: deviceId }       = request.params as { id: string };
-    const { orgId, sub: userId } = request.user;
+    const { orgId, sub: userId, role } = request.user;
 
     const parsed = assignBody.safeParse(request.body);
     if (!parsed.success) {
@@ -358,9 +435,7 @@ export default async function deviceRoutes(fastify: FastifyInstance) {
     if (!device) {
       return reply.status(404).send({ error: 'Device not found' });
     }
-    // Cast needed: Prisma client was generated before the DeviceStatus enum was
-    // expanded. Run `npx prisma generate` after migrating to clear the `as any`.
-    if ((device.status as string) !== 'in_stock') {
+    if (device.status !== 'in_stock') {
       return reply.status(409).send({
         error: `Device is not available for assignment (current status: ${device.status})`,
       });
@@ -373,10 +448,79 @@ export default async function deviceRoutes(fastify: FastifyInstance) {
       return reply.status(404).send({ error: 'Employee not found or not active' });
     }
 
+    // ── Governance gate: operators submit a request; admins execute directly ──
+    if (role !== 'admin') {
+      // Block if a pending approval already exists for this device
+      const conflict = await fastify.prisma.approval.findFirst({
+        where: { deviceId, orgId, status: 'pending' },
+      });
+      if (conflict) {
+        return reply.status(409).send({
+          error: 'A pending approval already exists for this device',
+        });
+      }
+
+      const [approval, requester, admins] = await Promise.all([
+        fastify.prisma.approval.create({
+          data: {
+            orgId,
+            type:        'assignment',
+            requestedBy: userId,
+            deviceId,
+            employeeId:  employee.id,
+            payload: {
+              employeeId:     parsed.data.employeeId,
+              conditionNotes: parsed.data.conditionNotes,
+              syncDepartment: parsed.data.syncDepartment,
+            },
+          },
+        }),
+        fastify.prisma.user.findUnique({
+          where:  { id: userId },
+          select: { name: true },
+        }),
+        fastify.prisma.user.findMany({
+          where:  { orgId, role: 'admin', isActive: true },
+          select: { email: true },
+        }),
+      ]);
+
+      await logAudit(fastify.prisma, {
+        orgId, userId,
+        action: 'approval.requested',
+        resourceType: 'approval',
+        resourceId: approval.id,
+        payload: { type: 'assignment', deviceId, employeeId: employee.id },
+      });
+
+      sendApprovalRequestedEmail({
+        adminEmails:   admins.map((a) => a.email),
+        requesterName: requester?.name ?? 'An operator',
+        type:          'assignment',
+        deviceModel:   device.model,
+        deviceSerial:  device.serial,
+        employeeName:  employee.name,
+      }).catch((err) => fastify.log.error({ err }, 'Failed to send approval request email'));
+
+      return reply.status(202).send({
+        ok: true,
+        approval,
+        message: 'Assignment request submitted for admin approval',
+      });
+    }
+    // ── Admin: execute directly (original flow) ───────────────────────────
+
     const ackToken     = crypto.randomUUID();
     const ackExpiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
 
-    // Atomic: close stale assignment + create new one + update device status
+    // If syncDepartment: copy employee's departmentId directly to the device
+    // (employee now has a FK departmentId, no string lookup needed)
+    const syncDeptId: string | undefined =
+      parsed.data.syncDepartment && employee.departmentId
+        ? employee.departmentId
+        : undefined;
+
+    // Atomic: close stale assignment + create new one + update device status (+ optional dept sync)
     const [, assignment] = await fastify.prisma.$transaction([
       fastify.prisma.deviceAssignment.updateMany({
         where: { deviceId, returnedAt: null },
@@ -391,9 +535,12 @@ export default async function deviceRoutes(fastify: FastifyInstance) {
           acknowledgeExpiresAt: ackExpiresAt,
         },
       }),
-      (fastify.prisma.device.update as any)({
+      fastify.prisma.device.update({
         where: { id: deviceId },
-        data:  { status: 'assigned' as DeviceStatus },
+        data:  {
+          status: 'assigned' as DeviceStatus,
+          ...(syncDeptId ? { departmentId: syncDeptId } : {}),
+        },
       }),
     ]);
 
@@ -440,7 +587,7 @@ export default async function deviceRoutes(fastify: FastifyInstance) {
         where: { deviceId, returnedAt: null },
         data:  { returnedAt: new Date() },
       }),
-      (fastify.prisma.device.update as any)({
+      fastify.prisma.device.update({
         where: { id: deviceId },
         data:  { status: 'in_stock' as DeviceStatus },
       }),

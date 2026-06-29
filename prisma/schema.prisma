@@ -44,6 +44,19 @@ enum EmployeeStatus {
 
 enum AlertType {
   unassigned_device
+  warranty_expiry
+}
+
+enum ApprovalType {
+  assignment
+  decommission
+  offboard
+}
+
+enum ApprovalStatus {
+  pending
+  approved
+  rejected
 }
 
 // ---------------------------------------------------------------------------
@@ -61,16 +74,16 @@ model Organization {
   users       User[]
   employees   Employee[]
   devices     Device[]
+  departments Department[]
+  locations   Location[]
   auditLogs   AuditLog[]
+  approvals   Approval[]
 
   @@map("organizations")
 }
 
 // ---------------------------------------------------------------------------
 // Users — platform login accounts (email + password, no OIDC)
-// Email is unique per org. Login resolves by email across orgs (first match
-// for the given credentials wins — acceptable since email domains are
-// typically org-scoped in practice).
 // ---------------------------------------------------------------------------
 
 model User {
@@ -88,6 +101,8 @@ model User {
   refreshTokens       RefreshToken[]
   passwordResetTokens PasswordResetToken[]
   auditLogs           AuditLog[]
+  approvalRequests    Approval[]           @relation("ApprovalRequester")
+  approvalReviews     Approval[]           @relation("ApprovalReviewer")
 
   @@unique([orgId, email])
   @@index([orgId])
@@ -95,7 +110,7 @@ model User {
 }
 
 // ---------------------------------------------------------------------------
-// Refresh tokens — hashed, one row per issued token
+// Refresh tokens
 // ---------------------------------------------------------------------------
 
 model RefreshToken {
@@ -113,7 +128,7 @@ model RefreshToken {
 }
 
 // ---------------------------------------------------------------------------
-// Password reset tokens — hashed, one row per requested reset
+// Password reset tokens
 // ---------------------------------------------------------------------------
 
 model PasswordResetToken {
@@ -132,28 +147,75 @@ model PasswordResetToken {
 
 // ---------------------------------------------------------------------------
 // Employees — people who hold devices (not platform users)
+// department stays as free-text string (not normalised in Phase 3)
 // ---------------------------------------------------------------------------
 
 model Employee {
-  id         String         @id @default(cuid())
-  orgId      String         @map("org_id")
-  name       String         @db.VarChar(200)
-  email      String         @db.VarChar(320)
-  department String?        @db.VarChar(100)
-  status     EmployeeStatus @default(active)
-  createdAt  DateTime       @default(now()) @map("created_at")
-  updatedAt  DateTime       @updatedAt     @map("updated_at")
+  id           String         @id @default(cuid())
+  orgId        String         @map("org_id")
+  name         String         @db.VarChar(200)
+  email        String         @db.VarChar(320)
+  departmentId String?        @map("department_id")
+  locationId   String?        @map("location_id")
+  status       EmployeeStatus @default(active)
+  createdAt    DateTime       @default(now()) @map("created_at")
+  updatedAt    DateTime       @updatedAt     @map("updated_at")
 
   org         Organization       @relation(fields: [orgId], references: [id])
+  department  Department?        @relation(fields: [departmentId], references: [id])
+  location    Location?          @relation(fields: [locationId], references: [id])
   assignments DeviceAssignment[]
+  approvals   Approval[]
 
   @@unique([orgId, email])
   @@index([orgId])
+  @@index([departmentId])
+  @@index([locationId])
   @@map("employees")
 }
 
 // ---------------------------------------------------------------------------
-// Devices — no check-in fields (tokenHash / hostname / lastSeen removed)
+// Departments — org unit / budget owner (FK on Device)
+// ---------------------------------------------------------------------------
+
+model Department {
+  id        String   @id @default(cuid())
+  orgId     String   @map("org_id")
+  name      String   @db.VarChar(100)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt     @map("updated_at")
+
+  org       Organization @relation(fields: [orgId], references: [id])
+  devices   Device[]
+  employees Employee[]
+
+  @@unique([orgId, name])
+  @@index([orgId])
+  @@map("departments")
+}
+
+// ---------------------------------------------------------------------------
+// Locations — physical location (FK on Device, orthogonal to Department)
+// ---------------------------------------------------------------------------
+
+model Location {
+  id        String   @id @default(cuid())
+  orgId     String   @map("org_id")
+  name      String   @db.VarChar(100)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt     @map("updated_at")
+
+  org       Organization @relation(fields: [orgId], references: [id])
+  devices   Device[]
+  employees Employee[]
+
+  @@unique([orgId, name])
+  @@index([orgId])
+  @@map("locations")
+}
+
+// ---------------------------------------------------------------------------
+// Devices
 // ---------------------------------------------------------------------------
 
 model Device {
@@ -167,12 +229,14 @@ model Device {
 
   // Asset identification
   assetTag     String?      @db.VarChar(50)   @map("asset_tag")
-  // @@unique([orgId, assetTag]) — enforced via partial index in migration SQL
-  // (WHERE asset_tag IS NOT NULL) so multiple devices can have no asset tag.
+  // @@unique([orgId, assetTag]) — partial index in migration (WHERE asset_tag IS NOT NULL)
 
-  // Location & ownership
-  location     String?      @db.VarChar(200)
-  department   String?      @db.VarChar(100)
+  // Departmental attribution (FK) and physical location (FK)
+  departmentId String?      @map("department_id")
+  locationId   String?      @map("location_id")
+
+  // Cost tracking
+  costCenter   String?      @db.VarChar(100)  @map("cost_center")
 
   // Procurement
   purchaseDate  DateTime?   @map("purchase_date")
@@ -192,27 +256,32 @@ model Device {
   updatedAt    DateTime     @updatedAt      @map("updated_at")
 
   org         Organization       @relation(fields: [orgId], references: [id])
+  department  Department?        @relation(fields: [departmentId], references: [id])
+  location    Location?          @relation(fields: [locationId], references: [id])
   assignments DeviceAssignment[]
   alerts      Alert[]
   images      DeviceImage[]
+  approvals   Approval[]
 
   @@unique([orgId, serial])
   @@index([orgId])
   @@index([orgId, status])
   @@index([warrantyEnd])
+  @@index([departmentId])
+  @@index([locationId])
   @@map("devices")
 }
 
 // ---------------------------------------------------------------------------
-// Device images — up to 5 images per device, stored on the filesystem
+// Device images
 // ---------------------------------------------------------------------------
 
 model DeviceImage {
   id           String   @id @default(cuid())
   deviceId     String   @map("device_id")
-  filename     String   @db.VarChar(200)  // stored name on disk (UUID-based)
+  filename     String   @db.VarChar(200)
   originalName String   @db.VarChar(500)  @map("original_name")
-  size         Int                         // bytes
+  size         Int
   mimeType     String   @db.VarChar(50)   @map("mime_type")
   createdAt    DateTime @default(now())   @map("created_at")
 
@@ -223,7 +292,7 @@ model DeviceImage {
 }
 
 // ---------------------------------------------------------------------------
-// Device assignments — one open row per device (returned_at IS NULL = active)
+// Device assignments
 // ---------------------------------------------------------------------------
 
 model DeviceAssignment {
@@ -263,20 +332,20 @@ model Alert {
 
   device Device @relation(fields: [deviceId], references: [id])
 
-  @@unique([deviceId, type, resolvedAt]) // dedup: one open alert per device per type
+  @@unique([deviceId, type, resolvedAt])
   @@index([deviceId])
   @@map("alerts")
 }
 
 // ---------------------------------------------------------------------------
-// Audit log — append-only, never updated or deleted
+// Audit log — append-only
 // ---------------------------------------------------------------------------
 
 model AuditLog {
   id           String   @id @default(cuid())
   orgId        String   @map("org_id")
-  userId       String?  @map("user_id") // null for system actions (jobs)
-  action       String   @db.VarChar(100) // e.g. device.created, user.login
+  userId       String?  @map("user_id")
+  action       String   @db.VarChar(100)
   resourceType String   @map("resource_type") @db.VarChar(50)
   resourceId   String   @map("resource_id")
   payload      Json     @default("{}")
@@ -288,4 +357,37 @@ model AuditLog {
   @@index([orgId, ts])
   @@index([resourceType, resourceId])
   @@map("audit_logs")
+}
+
+// ---------------------------------------------------------------------------
+// Approvals — governance workflow (operator requests, admin approves/rejects)
+// ---------------------------------------------------------------------------
+
+model Approval {
+  id          String         @id @default(cuid())
+  orgId       String         @map("org_id")
+  type        ApprovalType
+  status      ApprovalStatus @default(pending)
+  requestedBy String         @map("requested_by")
+  reviewedBy  String?        @map("reviewed_by")
+  // Nullable: offboard approvals have no deviceId; decommission approvals have no employeeId
+  deviceId    String?        @map("device_id")
+  employeeId  String?        @map("employee_id")
+  // Stores the action parameters needed to execute on approval
+  payload     Json           @default("{}")
+  reviewNote  String?        @db.VarChar(1000) @map("review_note")
+  createdAt   DateTime       @default(now())   @map("created_at")
+  resolvedAt  DateTime?      @map("resolved_at")
+
+  org       Organization @relation(fields: [orgId], references: [id])
+  requester User         @relation("ApprovalRequester", fields: [requestedBy], references: [id])
+  reviewer  User?        @relation("ApprovalReviewer",  fields: [reviewedBy],  references: [id])
+  device    Device?      @relation(fields: [deviceId],   references: [id], onDelete: SetNull)
+  employee  Employee?    @relation(fields: [employeeId], references: [id], onDelete: SetNull)
+
+  @@index([orgId, status])
+  @@index([requestedBy])
+  @@index([deviceId])
+  @@index([employeeId])
+  @@map("approvals")
 }

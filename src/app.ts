@@ -13,13 +13,17 @@ import storagePlugin from './plugins/storage.js';
 import emailerPlugin from './plugins/emailer.js';
 import { config } from './config.js';
 
-import authRoutes from './routes/auth.js';
-import deviceRoutes from './routes/devices.js';
-import employeeRoutes from './routes/employees.js';
+import authRoutes       from './routes/auth.js';
+import deviceRoutes     from './routes/devices.js';
+import employeeRoutes   from './routes/employees.js';
 import assignmentRoutes from './routes/assignments.js';
-import auditRoutes from './routes/audit.js';
-import reportRoutes from './routes/reports.js';
-import userRoutes from './routes/users.js';
+import auditRoutes      from './routes/audit.js';
+import reportRoutes     from './routes/reports.js';
+import userRoutes       from './routes/users.js';
+import alertRoutes      from './routes/alerts.js';
+import departmentRoutes from './routes/departments.js';
+import locationRoutes   from './routes/locations.js';
+import approvalRoutes   from './routes/approvals.js';
 
 export async function buildApp() {
   const fastify = Fastify({
@@ -96,7 +100,11 @@ export async function buildApp() {
   await fastify.register(employeeRoutes, v1Prefix);
   await fastify.register(assignmentRoutes, v1Prefix);
   await fastify.register(auditRoutes, v1Prefix);
-  await fastify.register(reportRoutes, v1Prefix);
+  await fastify.register(alertRoutes,      v1Prefix);
+  await fastify.register(departmentRoutes, v1Prefix);
+  await fastify.register(locationRoutes,   v1Prefix);
+  await fastify.register(approvalRoutes,   v1Prefix);
+  await fastify.register(reportRoutes,     v1Prefix);
 
   return fastify;
 }

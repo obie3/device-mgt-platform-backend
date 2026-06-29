@@ -1,19 +1,25 @@
 import { FastifyInstance } from 'fastify';
+import { Prisma } from '@prisma/client';
 import { z } from 'zod';
 import { requireRole } from '../middleware/rbac.js';
 import { logAudit } from '../services/audit.service.js';
-import { sendOffboardingAlert } from '../services/notification.service.js';
+import {
+  sendOffboardingAlert,
+  sendApprovalRequestedEmail,
+} from '../services/notification.service.js';
 
 const createEmployeeBody = z.object({
-  name: z.string().min(1),
-  email: z.string().email(),
-  department: z.string().optional(),
+  name:         z.string().min(1).max(200),
+  email:        z.string().email().max(320),
+  departmentId: z.string().nullable().optional(),
+  locationId:   z.string().nullable().optional(),
 });
 
 const updateEmployeeBody = z.object({
-  name: z.string().min(1).optional(),
-  email: z.string().email().optional(),
-  department: z.string().optional(),
+  name:         z.string().min(1).max(200).optional(),
+  email:        z.string().email().max(320).optional(),
+  departmentId: z.string().nullable().optional(),
+  locationId:   z.string().nullable().optional(),
 });
 
 const listQuery = z.object({
@@ -37,13 +43,13 @@ export default async function employeeRoutes(fastify: FastifyInstance) {
     const { orgId } = request.user;
     const { search, status, page, limit } = query.data;
 
-    const where: Record<string, unknown> = { orgId };
+    const where: Prisma.EmployeeWhereInput = { orgId };
     if (status) where.status = status;
     if (search) {
       where.OR = [
-        { name: { contains: search, mode: 'insensitive' } },
-        { email: { contains: search, mode: 'insensitive' } },
-        { department: { contains: search, mode: 'insensitive' } },
+        { name:       { contains: search, mode: 'insensitive' } },
+        { email:      { contains: search, mode: 'insensitive' } },
+        { department: { is: { name: { contains: search, mode: 'insensitive' } } } },
       ];
     }
 
@@ -54,6 +60,8 @@ export default async function employeeRoutes(fastify: FastifyInstance) {
         take: limit,
         orderBy: { name: 'asc' },
         include: {
+          department: { select: { id: true, name: true } },
+          location:   { select: { id: true, name: true } },
           assignments: {
             where: { returnedAt: null },
             include: {
@@ -101,6 +109,10 @@ export default async function employeeRoutes(fastify: FastifyInstance) {
 
       const employee = await fastify.prisma.employee.create({
         data: { orgId, ...parsed.data },
+        include: {
+          department: { select: { id: true, name: true } },
+          location:   { select: { id: true, name: true } },
+        },
       });
 
       await logAudit(fastify.prisma, {
@@ -127,11 +139,18 @@ export default async function employeeRoutes(fastify: FastifyInstance) {
       const employee = await fastify.prisma.employee.findFirst({
         where: { id, orgId },
         include: {
+          department: { select: { id: true, name: true } },
+          location:   { select: { id: true, name: true } },
           assignments: {
             orderBy: { assignedAt: 'desc' },
             include: {
               device: {
-                select: { id: true, serial: true, model: true, type: true },
+                select: {
+                  id: true, serial: true, model: true, type: true, status: true,
+                  assetTag: true,
+                  department: { select: { name: true } },
+                  location:   { select: { name: true } },
+                },
               },
             },
           },
@@ -169,6 +188,10 @@ export default async function employeeRoutes(fastify: FastifyInstance) {
       const updated = await fastify.prisma.employee.update({
         where: { id },
         data: parsed.data,
+        include: {
+          department: { select: { id: true, name: true } },
+          location:   { select: { id: true, name: true } },
+        },
       });
 
       await logAudit(fastify.prisma, {
@@ -189,8 +212,8 @@ export default async function employeeRoutes(fastify: FastifyInstance) {
     '/employees/:id/offboard',
     { preHandler: operator },
     async (request, reply) => {
-      const { id } = request.params as { id: string };
-      const { orgId, sub: userId } = request.user;
+      const { id }                       = request.params as { id: string };
+      const { orgId, sub: userId, role } = request.user;
 
       const employee = await fastify.prisma.employee.findFirst({
         where: { id, orgId, status: 'active' },
@@ -206,6 +229,60 @@ export default async function employeeRoutes(fastify: FastifyInstance) {
       if (!employee) {
         return reply.status(404).send({ error: 'Employee not found or already offboarded' });
       }
+
+      // ── Governance gate: operators must request offboard approval ─────────
+      if (role !== 'admin') {
+        const conflict = await fastify.prisma.approval.findFirst({
+          where: { employeeId: id, orgId, status: 'pending', type: 'offboard' },
+        });
+        if (conflict) {
+          return reply.status(409).send({
+            error: 'A pending offboard approval already exists for this employee',
+          });
+        }
+
+        const [approval, requester, admins] = await Promise.all([
+          fastify.prisma.approval.create({
+            data: {
+              orgId,
+              type:        'offboard',
+              requestedBy: userId,
+              employeeId:  id,
+              payload:     {},
+            },
+          }),
+          fastify.prisma.user.findUnique({
+            where:  { id: userId },
+            select: { name: true },
+          }),
+          fastify.prisma.user.findMany({
+            where:  { orgId, role: 'admin', isActive: true },
+            select: { email: true },
+          }),
+        ]);
+
+        await logAudit(fastify.prisma, {
+          orgId, userId,
+          action: 'approval.requested',
+          resourceType: 'approval',
+          resourceId: approval.id,
+          payload: { type: 'offboard', employeeId: id },
+        });
+
+        sendApprovalRequestedEmail({
+          adminEmails:   admins.map((a) => a.email),
+          requesterName: requester?.name ?? 'An operator',
+          type:          'offboard',
+          employeeName:  employee.name,
+        }).catch((err) => fastify.log.error({ err }, 'Failed to send approval request email'));
+
+        return reply.status(202).send({
+          ok: true,
+          approval,
+          message: 'Offboard request submitted for admin approval',
+        });
+      }
+      // ── Admin: execute directly (original flow) ───────────────────────────
 
       // Mark employee offboarded
       await fastify.prisma.employee.update({
@@ -241,10 +318,10 @@ export default async function employeeRoutes(fastify: FastifyInstance) {
 
         if (itUser) {
           sendOffboardingAlert({
-            itEmail: itUser.email,
+            itEmail:      itUser.email,
             employeeName: employee.name,
             devices: employee.assignments.map((a) => ({
-              model: a.device.model,
+              model:  a.device.model,
               serial: a.device.serial,
             })),
           }).catch((err) =>

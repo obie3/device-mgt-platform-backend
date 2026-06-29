@@ -2,6 +2,7 @@ import PgBoss from 'pg-boss';
 import { PrismaClient } from '@prisma/client';
 import { config } from '../config.js';
 import { runUnassignedDeviceJob } from './unassigned-device.job.js';
+import { runWarrantyExpiryJob } from './warranty-expiry.job.js';
 
 let boss: PgBoss | null = null;
 
@@ -27,6 +28,12 @@ export async function startScheduler(prisma: PrismaClient) {
   await boss.schedule('unassigned-device-check', '0 8 * * *');
   await boss.work('unassigned-device-check', workerOpts, async () => {
     await runUnassignedDeviceJob(prisma);
+  });
+
+  // Schedule: warranty expiry check daily at 09:00
+  await boss.schedule('warranty-expiry-check', '0 9 * * *');
+  await boss.work('warranty-expiry-check', workerOpts, async () => {
+    await runWarrantyExpiryJob(prisma);
   });
 
   // Cleanup expired refresh tokens weekly (Sunday 03:00)
