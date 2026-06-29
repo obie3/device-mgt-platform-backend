@@ -1,5 +1,5 @@
 import { PrismaClient } from '@prisma/client';
-import { sendUnassignedDeviceAlert } from '../services/notification.service.js';
+import { sendUnassignedDeviceAlert, sendSlack } from '../services/notification.service.js';
 
 export async function runUnassignedDeviceJob(prisma: PrismaClient) {
   console.log('[job:unassigned-device] starting');
@@ -8,6 +8,7 @@ export async function runUnassignedDeviceJob(prisma: PrismaClient) {
     select: {
       id: true,
       unassignedAlertDays: true,
+      settings: true,
       users: {
         where: { role: 'admin', isActive: true },
         select: { email: true },
@@ -48,6 +49,7 @@ export async function runUnassignedDeviceJob(prisma: PrismaClient) {
     });
 
     const itEmail = org.users[0]?.email;
+    const orgSlack = (org.settings as Record<string, unknown>)?.slackWebhookUrl as string | undefined;
 
     for (const device of candidates) {
       const lastReturned = device.assignments[0]?.returnedAt;
@@ -55,11 +57,13 @@ export async function runUnassignedDeviceJob(prisma: PrismaClient) {
 
       if (unassignedSince > cutoff) continue; // not yet exceeded threshold
 
+      const message = `Device ${device.model} (${device.serial}) has been unassigned since ${unassignedSince.toISOString()}`;
+
       await prisma.alert.create({
         data: {
           deviceId: device.id,
           type: 'unassigned_device',
-          message: `Device ${device.model} (${device.serial}) has been unassigned since ${unassignedSince.toISOString()}`,
+          message,
         },
       });
 
@@ -72,6 +76,8 @@ export async function runUnassignedDeviceJob(prisma: PrismaClient) {
           thresholdDays: org.unassignedAlertDays,
         });
       }
+
+      await sendSlack(`⚠️ ${message}`, orgSlack);
 
       alertsSent++;
     }

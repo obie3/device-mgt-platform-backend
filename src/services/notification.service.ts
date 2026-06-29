@@ -22,13 +22,20 @@ async function sendEmail(opts: { to: string; subject: string; html: string }) {
 // Slack
 // ---------------------------------------------------------------------------
 
-export async function sendSlack(text: string) {
-  if (!config.SLACK_WEBHOOK_URL) return;
-  await fetch(config.SLACK_WEBHOOK_URL, {
-    method:  'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body:    JSON.stringify({ text }),
-  });
+// webhookUrl: per-org webhook stored in org.settings.slackWebhookUrl; falls
+// back to the global env-var webhook so both can coexist.
+export async function sendSlack(text: string, webhookUrl?: string | null) {
+  const url = webhookUrl || config.SLACK_WEBHOOK_URL;
+  if (!url) return;
+  try {
+    await fetch(url, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ text }),
+    });
+  } catch (err) {
+    console.error('[slack] Failed to send notification:', err);
+  }
 }
 
 // ---------------------------------------------------------------------------

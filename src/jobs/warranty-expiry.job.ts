@@ -1,5 +1,5 @@
 import { PrismaClient } from '@prisma/client';
-import { sendWarrantyExpiryAlert } from '../services/notification.service.js';
+import { sendWarrantyExpiryAlert, sendSlack } from '../services/notification.service.js';
 
 // Alert window: devices whose warranty ends within this many days get flagged.
 // Also catches devices whose warranty has already expired (warrantyEnd <= now).
@@ -13,6 +13,7 @@ export async function runWarrantyExpiryJob(prisma: PrismaClient) {
   const orgs = await prisma.organization.findMany({
     select: {
       id: true,
+      settings: true,
       users: {
         where: { role: 'admin', isActive: true },
         select: { email: true },
@@ -45,6 +46,7 @@ export async function runWarrantyExpiryJob(prisma: PrismaClient) {
     });
 
     const itEmail = org.users[0]?.email;
+    const orgSlack = (org.settings as Record<string, unknown>)?.slackWebhookUrl as string | undefined;
 
     for (const device of candidates) {
       const warrantyEnd = device.warrantyEnd!; // guaranteed non-null by the query filter
@@ -72,6 +74,8 @@ export async function runWarrantyExpiryJob(prisma: PrismaClient) {
           isExpired,
         });
       }
+
+      await sendSlack(`🔔 ${message}`, orgSlack);
 
       alertsSent++;
     }

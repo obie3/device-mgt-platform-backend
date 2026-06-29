@@ -24,6 +24,9 @@ import alertRoutes      from './routes/alerts.js';
 import departmentRoutes from './routes/departments.js';
 import locationRoutes   from './routes/locations.js';
 import approvalRoutes   from './routes/approvals.js';
+import orgRoutes        from './routes/org.js';
+import repairRoutes     from './routes/repairs.js';
+import analyticsRoutes  from './routes/analytics.js';
 
 export async function buildApp() {
   const fastify = Fastify({
@@ -104,6 +107,9 @@ export async function buildApp() {
   await fastify.register(departmentRoutes, v1Prefix);
   await fastify.register(locationRoutes,   v1Prefix);
   await fastify.register(approvalRoutes,   v1Prefix);
+  await fastify.register(orgRoutes,        v1Prefix);
+  await fastify.register(repairRoutes,     v1Prefix);
+  await fastify.register(analyticsRoutes,  v1Prefix);
   await fastify.register(reportRoutes,     v1Prefix);
 
   return fastify;

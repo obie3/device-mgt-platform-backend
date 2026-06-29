@@ -1,5 +1,6 @@
 import { FastifyInstance } from 'fastify';
-import { Prisma } from '@prisma/client';
+import { z } from 'zod';
+import { Prisma, DeviceStatus, DeviceType } from '@prisma/client';
 import { stringify } from 'csv-stringify/sync';
 import { requireRole } from '../middleware/rbac.js';
 
@@ -13,6 +14,14 @@ function warrantyStatus(warrantyEnd: Date | null): 'active' | 'expiring' | 'expi
 }
 
 export default async function reportRoutes(fastify: FastifyInstance) {
+  const fleetQuery = z.object({
+    page:   z.coerce.number().int().min(1).default(1),
+    limit:  z.coerce.number().int().min(1).max(100).default(25),
+    search: z.string().max(200).optional(),
+    status: z.nativeEnum(DeviceStatus).optional(),
+    type:   z.nativeEnum(DeviceType).optional(),
+  });
+
   // ── GET /api/v1/reports/fleet ─────────────────────────────────────────────
   fastify.get(
     '/reports/fleet',
@@ -21,25 +30,47 @@ export default async function reportRoutes(fastify: FastifyInstance) {
       const { orgId } = request.user;
       const accept = request.headers.accept ?? 'application/json';
 
-      const devices = await fastify.prisma.device.findMany({
-        where: { orgId },
-        orderBy: { createdAt: 'desc' },
-        include: {
-          department: { select: { name: true } },
-          location:   { select: { name: true } },
-          assignments: {
-            where: { returnedAt: null },
-            include: {
-              employee: {
-                select: { name: true, email: true, department: { select: { name: true } } },
-              },
-            },
-            take: 1,
-          },
-        },
-      });
+      // For CSV: always fetch all records, ignore pagination params
+      const isCsv = accept.includes('text/csv');
 
-      const rows = devices.map((d) => {
+      const parsed = fleetQuery.safeParse(request.query);
+      if (!parsed.success) {
+        return reply.status(400).send({ error: parsed.error.flatten() });
+      }
+      const { page, limit, search, status, type } = parsed.data;
+
+      // Build where clause shared between JSON + CSV
+      const where: Prisma.DeviceWhereInput = {
+        orgId,
+        ...(status && { status }),
+        ...(type   && { type }),
+        ...(search && {
+          OR: [
+            { serial:       { contains: search, mode: 'insensitive' } },
+            { model:        { contains: search, mode: 'insensitive' } },
+            { manufacturer: { contains: search, mode: 'insensitive' } },
+            { assetTag:     { contains: search, mode: 'insensitive' } },
+          ],
+        }),
+      };
+
+      const include = {
+        department: { select: { name: true } },
+        location:   { select: { name: true } },
+        assignments: {
+          where: { returnedAt: null },
+          include: {
+            employee: {
+              select: { name: true, email: true, department: { select: { name: true } } },
+            },
+          },
+          take: 1,
+        },
+      } satisfies Prisma.DeviceInclude;
+
+      type DeviceWithRelations = Prisma.DeviceGetPayload<{ include: typeof include }>;
+
+      const mapRow = (d: DeviceWithRelations) => {
         const assignment = d.assignments[0] ?? null;
         return {
           id:               d.id,
@@ -65,10 +96,11 @@ export default async function reportRoutes(fastify: FastifyInstance) {
           assignedAt:       assignment?.assignedAt.toISOString() ?? '',
           notes:            d.notes ?? '',
         };
-      });
+      };
 
-      if (accept.includes('text/csv')) {
-        const csv = stringify(rows, { header: true });
+      if (isCsv) {
+        const all = await fastify.prisma.device.findMany({ where, orderBy: { createdAt: 'desc' }, include });
+        const csv = stringify(all.map(mapRow), { header: true });
         return reply
           .header('Content-Type', 'text/csv')
           .header(
@@ -78,7 +110,24 @@ export default async function reportRoutes(fastify: FastifyInstance) {
           .send(csv);
       }
 
-      return reply.send({ data: rows, total: rows.length });
+      const [devices, total] = await Promise.all([
+        fastify.prisma.device.findMany({
+          where,
+          orderBy: { createdAt: 'desc' },
+          include,
+          skip:  (page - 1) * limit,
+          take:  limit,
+        }),
+        fastify.prisma.device.count({ where }),
+      ]);
+
+      return reply.send({
+        data:  devices.map(mapRow),
+        total,
+        page,
+        pages: Math.ceil(total / limit),
+        limit,
+      });
     }
   );
 

@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { DeviceStatus, DeviceType, Prisma } from '@prisma/client';
 import { requireRole }            from '../middleware/rbac.js';
 import { logAudit }               from '../services/audit.service.js';
+import { parse as csvParse }      from 'csv-parse/sync';
 import {
   sendAssignmentAckEmail,
   sendApprovalRequestedEmail,
@@ -98,6 +99,7 @@ const listQuery = z.object({
   search:           z.string().max(200).optional(),
   departmentId:     z.string().optional(),
   locationId:       z.string().optional(),
+  costCenter:       z.string().max(100).optional(),
   /** Return only devices whose warranty expires within N days */
   warrantyExpiring: z.coerce.number().int().min(1).max(365).optional(),
   /** Return only devices whose warranty has already expired */
@@ -118,13 +120,14 @@ export default async function deviceRoutes(fastify: FastifyInstance) {
     }
 
     const { orgId } = request.user;
-    const { type, status, assigned, search, departmentId, locationId, warrantyExpiring, warrantyExpired, page, limit } = query.data;
+    const { type, status, assigned, search, departmentId, locationId, costCenter, warrantyExpiring, warrantyExpired, page, limit } = query.data;
 
     const where: Prisma.DeviceWhereInput = { orgId };
     if (type)         where.type         = type;
     if (status)       where.status       = status;
     if (departmentId) where.departmentId = departmentId;
     if (locationId)   where.locationId   = locationId;
+    if (costCenter)   where.costCenter   = { equals: costCenter, mode: 'insensitive' };
     if (search) {
       where.OR = [
         { serial:     { contains: search, mode: 'insensitive' } },
@@ -224,6 +227,132 @@ export default async function deviceRoutes(fastify: FastifyInstance) {
     });
 
     return reply.status(201).send(device);
+  });
+
+  // ── POST /api/v1/devices/import ────────────────────────────────────────────
+  // CSV columns (header required):
+  //   serial, type, model, manufacturer*, assetTag*, department*, location*,
+  //   costCenter*, supplier*, purchaseDate*, purchasePrice*, warrantyStart*,
+  //   warrantyEnd*, warrantyProvider*, notes*   (* = optional)
+  fastify.post('/devices/import', { preHandler: operator }, async (request, reply) => {
+    const { orgId, sub: userId } = request.user;
+
+    // Read multipart file
+    const data = await request.file();
+    if (!data) return reply.status(400).send({ error: 'No file uploaded' });
+    if (!data.filename.toLowerCase().endsWith('.csv')) {
+      return reply.status(400).send({ error: 'Only .csv files are accepted' });
+    }
+
+    const MAX_CSV_BYTES = 2 * 1024 * 1024; // 2 MB
+    const chunks: Buffer[] = [];
+    let totalBytes = 0;
+    for await (const chunk of data.file) {
+      totalBytes += chunk.length;
+      if (totalBytes > MAX_CSV_BYTES) {
+        return reply.status(413).send({ error: 'CSV file exceeds the 2 MB limit' });
+      }
+      chunks.push(chunk);
+    }
+    const csvText = Buffer.concat(chunks).toString('utf-8');
+
+    // Parse CSV
+    let rows: Record<string, string>[];
+    try {
+      rows = csvParse(csvText, { columns: true, skip_empty_lines: true, trim: true });
+    } catch {
+      return reply.status(400).send({ error: 'Failed to parse CSV — ensure it has a header row and uses comma delimiters' });
+    }
+
+    if (rows.length === 0) return reply.status(400).send({ error: 'CSV contains no data rows' });
+    if (rows.length > 500) return reply.status(400).send({ error: 'CSV exceeds 500 row limit per import' });
+
+    // Pre-load org departments and locations for name→id resolution
+    const [departments, locations] = await Promise.all([
+      fastify.prisma.department.findMany({ where: { orgId }, select: { id: true, name: true } }),
+      fastify.prisma.location.findMany({   where: { orgId }, select: { id: true, name: true } }),
+    ]);
+    const deptMap = new Map(departments.map((d) => [d.name.toLowerCase(), d.id]));
+    const locMap  = new Map(locations.map((l)  => [l.name.toLowerCase(), l.id]));
+
+    const VALID_TYPES = new Set(Object.values(DeviceType));
+
+    const imported: string[] = [];
+    const errors: { row: number; error: string }[] = [];
+
+    for (let i = 0; i < rows.length; i++) {
+      const row    = rows[i];
+      const rowNum = i + 2; // 1-based, +1 for header
+
+      const serial = row['serial']?.trim();
+      const type   = row['type']?.trim().toLowerCase();
+      const model  = row['model']?.trim();
+
+      // Required fields
+      if (!serial)               { errors.push({ row: rowNum, error: 'Missing serial' });       continue; }
+      if (!type)                 { errors.push({ row: rowNum, error: 'Missing type' });         continue; }
+      if (!VALID_TYPES.has(type as DeviceType)) {
+        errors.push({ row: rowNum, error: `Invalid type "${type}". Valid: ${[...VALID_TYPES].join(', ')}` });
+        continue;
+      }
+      if (!model)                { errors.push({ row: rowNum, error: 'Missing model' });        continue; }
+
+      // Duplicate serial check within this org
+      const existing = await fastify.prisma.device.findUnique({
+        where: { orgId_serial: { orgId, serial } },
+      });
+      if (existing) { errors.push({ row: rowNum, error: `Serial "${serial}" already exists` }); continue; }
+
+      // Optional FK resolution
+      const deptName = row['department']?.trim();
+      const locName  = row['location']?.trim();
+      const departmentId = deptName ? (deptMap.get(deptName.toLowerCase()) ?? null) : null;
+      const locationId   = locName  ? (locMap.get(locName.toLowerCase())   ?? null) : null;
+
+      // Optional numerics
+      const purchasePriceRaw = row['purchasePrice']?.trim();
+      const purchasePrice    = purchasePriceRaw ? parseFloat(purchasePriceRaw) : undefined;
+
+      try {
+        const device = await fastify.prisma.device.create({
+          data: {
+            orgId,
+            serial,
+            type:             type as DeviceType,
+            model,
+            manufacturer:     row['manufacturer']?.trim()     || undefined,
+            assetTag:         row['assetTag']?.trim()         || undefined,
+            costCenter:       row['costCenter']?.trim()       || undefined,
+            supplier:         row['supplier']?.trim()         || undefined,
+            notes:            row['notes']?.trim()            || undefined,
+            warrantyProvider: row['warrantyProvider']?.trim() || undefined,
+            departmentId,
+            locationId,
+            purchasePrice:    purchasePrice && !isNaN(purchasePrice) ? purchasePrice : undefined,
+            purchaseDate:     row['purchaseDate']?.trim()    ? new Date(row['purchaseDate']!.trim())    : undefined,
+            warrantyStart:    row['warrantyStart']?.trim()   ? new Date(row['warrantyStart']!.trim())   : undefined,
+            warrantyEnd:      row['warrantyEnd']?.trim()     ? new Date(row['warrantyEnd']!.trim())     : undefined,
+          },
+        });
+        imported.push(device.id);
+      } catch {
+        errors.push({ row: rowNum, error: `Failed to create device "${serial}"` });
+      }
+    }
+
+    await logAudit(fastify.prisma, {
+      orgId, userId,
+      action: 'device.bulk_imported',
+      resourceType: 'device',
+      resourceId: orgId,
+      payload: { imported: imported.length, errors: errors.length },
+    });
+
+    return reply.status(200).send({
+      imported: imported.length,
+      skipped:  errors.length,
+      errors,
+    });
   });
 
   // ── GET /api/v1/devices/:id ────────────────────────────────────────────────
