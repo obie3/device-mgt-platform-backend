@@ -1,4 +1,4 @@
-FROM node:20-slim AS builder
+FROM node:22-slim AS builder
 WORKDIR /app
 
 # Install OpenSSL — required by Prisma's query engine on Debian slim
@@ -10,7 +10,7 @@ COPY . .
 RUN yarn db:generate
 RUN yarn build
 
-FROM node:20-slim AS runner
+FROM node:22-slim AS runner
 WORKDIR /app
 ENV NODE_ENV=production
 
