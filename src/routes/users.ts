@@ -55,7 +55,9 @@ export default async function userRoutes(fastify: FastifyInstance) {
     }
 
     const { orgId, sub: actorId } = request.user;
-    const { name, email, password, role } = parsed.data;
+    const { name, password, role } = parsed.data;
+    // Normalise before DB write — consistent with loginUser's lowercase lookup
+    const email = parsed.data.email.toLowerCase().trim();
 
     // Check uniqueness within this org only — email may legitimately belong to
     // a user in another org (the schema now enforces @@unique([orgId, email])).
@@ -102,6 +104,8 @@ export default async function userRoutes(fastify: FastifyInstance) {
       if (!target) return reply.status(404).send({ error: 'User not found' });
 
       const { password, ...rest } = parsed.data;
+      // Note: updateUserBody has no email field — email changes go through
+      // PATCH /auth/me which already normalises to lowercase.
       const data: Record<string, unknown> = { ...rest };
       if (password) {
         data.passwordHash = await hashPassword(password);

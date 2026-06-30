@@ -1,24 +1,14 @@
 import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
+import { requireRole } from '../middleware/rbac.js';
 import { logAudit } from '../services/audit.service.js';
 
-const adminOnly = [
-  (fastify: FastifyInstance) => fastify.authenticate,
-].map(() => {}) as unknown as Parameters<FastifyInstance['addHook']>[1][];
-
 export default async function orgRoutes(fastify: FastifyInstance) {
-  const { authenticate } = fastify;
-
-  // Only admins can read/write org settings
-  async function requireAdmin(request: Parameters<typeof authenticate>[0], reply: Parameters<typeof authenticate>[1]) {
-    await fastify.authenticate(request, reply);
-    if ((request.user as { role?: string })?.role !== 'admin') {
-      return reply.status(403).send({ error: 'Admin access required' });
-    }
-  }
+  // Standard RBAC pattern — consistent with every other route in the app
+  const adminOnly = [fastify.authenticate, requireRole('admin')];
 
   // ── GET /api/v1/org ────────────────────────────────────────────────────────
-  fastify.get('/org', { preHandler: [requireAdmin] }, async (request, reply) => {
+  fastify.get('/org', { preHandler: adminOnly }, async (request, reply) => {
     const { orgId } = request.user;
 
     const org = await fastify.prisma.organization.findUnique({
@@ -33,12 +23,12 @@ export default async function orgRoutes(fastify: FastifyInstance) {
 
   // ── PATCH /api/v1/org ──────────────────────────────────────────────────────
   const updateOrgBody = z.object({
-    name:               z.string().min(1).max(200).optional(),
+    name:                z.string().min(1).max(200).optional(),
     unassignedAlertDays: z.number().int().min(1).max(365).optional(),
-    slackWebhookUrl:    z.string().url().max(500).or(z.literal('')).optional(),
+    slackWebhookUrl:     z.string().url().max(500).or(z.literal('')).optional(),
   });
 
-  fastify.patch('/org', { preHandler: [requireAdmin] }, async (request, reply) => {
+  fastify.patch('/org', { preHandler: adminOnly }, async (request, reply) => {
     const { orgId, sub: userId } = request.user;
 
     const parsed = updateOrgBody.safeParse(request.body);
@@ -64,7 +54,7 @@ export default async function orgRoutes(fastify: FastifyInstance) {
     const updated = await fastify.prisma.organization.update({
       where: { id: orgId },
       data: {
-        ...(name               !== undefined && { name }),
+        ...(name                !== undefined && { name }),
         ...(unassignedAlertDays !== undefined && { unassignedAlertDays }),
         settings: newSettings as Parameters<typeof fastify.prisma.organization.update>[0]['data']['settings'],
       },
@@ -74,10 +64,10 @@ export default async function orgRoutes(fastify: FastifyInstance) {
     await logAudit(fastify.prisma, {
       orgId,
       userId,
-      action: 'org.settings_updated',
+      action:       'org.settings_updated',
       resourceType: 'organization',
-      resourceId: orgId,
-      payload: { fields: Object.keys(parsed.data) },
+      resourceId:   orgId,
+      payload:      { fields: Object.keys(parsed.data) },
     });
 
     return reply.send(updated);

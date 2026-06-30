@@ -158,7 +158,8 @@ export default async function approvalRoutes(fastify: FastifyInstance) {
         }
 
         const ackToken  = crypto.randomUUID();
-        const ackExpiry = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+        // 72 hours — consistent with devices.ts Fix #8 (reduced from 7 days)
+        const ackExpiry = new Date(Date.now() + 72 * 60 * 60 * 1000);
         const syncDeptId =
           p.syncDepartment && employee.departmentId ? employee.departmentId : undefined;
 

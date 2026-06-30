@@ -1,5 +1,6 @@
 import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
+import { requireRole } from '../middleware/rbac.js';
 
 const listQuery = z.object({
   resourceType: z.string().optional(),
@@ -16,7 +17,7 @@ export default async function auditRoutes(fastify: FastifyInstance) {
   // GET /api/v1/audit
   fastify.get(
     '/audit',
-    { preHandler: [fastify.authenticate] },
+    { preHandler: [fastify.authenticate, requireRole('operator')] },
     async (request, reply) => {
       const query = listQuery.safeParse(request.query);
       if (!query.success) {

@@ -29,7 +29,7 @@
     "csv-stringify": "^6.5.1",
     "fastify": "^4.28.1",
     "fastify-plugin": "^4.5.1",
-    "file-type": "^18.7.0",
+    "file-type": "^22.0.0",
     "jsonwebtoken": "^9.0.2",
     "nodemailer": "^9.0.2",
     "pg-boss": "^9.0.3",

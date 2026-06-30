@@ -240,7 +240,9 @@ export default async function authRoutes(fastify: FastifyInstance) {
       const parsed = updateMeBody.safeParse(request.body);
       if (!parsed.success) return reply.status(400).send({ error: parsed.error.flatten() });
 
+      // Normalise email to lowercase — consistent with loginUser lookup
       if (parsed.data.email) {
+        parsed.data.email = parsed.data.email.toLowerCase().trim();
         const existing = await fastify.prisma.user.findFirst({
           where: { orgId, email: parsed.data.email, NOT: { id: userId } },
         });
