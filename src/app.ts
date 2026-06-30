@@ -1,5 +1,6 @@
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
+import cookie from '@fastify/cookie';
 import helmet from '@fastify/helmet';
 import multipart from '@fastify/multipart';
 import rateLimit from '@fastify/rate-limit';
@@ -63,6 +64,9 @@ export async function buildApp() {
     origin: config.CORS_ORIGIN,
     credentials: true,
   });
+
+  // HttpOnly cookies for refresh tokens (Fix #1 — XSS hardening)
+  await fastify.register(cookie);
 
   // Global rate limit — individual auth routes add tighter per-route limits
   // on top of this (see routes/auth.ts).

@@ -89,15 +89,17 @@ model Organization {
 // ---------------------------------------------------------------------------
 
 model User {
-  id           String   @id @default(cuid())
-  orgId        String   @map("org_id")
-  name         String   @db.VarChar(200)
-  email        String   @db.VarChar(320)
-  passwordHash String   @map("password_hash")
-  role         UserRole @default(viewer)
-  isActive     Boolean  @default(true) @map("is_active")
-  createdAt    DateTime @default(now()) @map("created_at")
-  updatedAt    DateTime @updatedAt     @map("updated_at")
+  id                   String    @id @default(cuid())
+  orgId                String    @map("org_id")
+  name                 String    @db.VarChar(200)
+  email                String    @db.VarChar(320)
+  passwordHash         String    @map("password_hash")
+  role                 UserRole  @default(viewer)
+  isActive             Boolean   @default(true) @map("is_active")
+  failedLoginAttempts  Int       @default(0)    @map("failed_login_attempts")
+  lockedUntil          DateTime?               @map("locked_until")
+  createdAt            DateTime  @default(now()) @map("created_at")
+  updatedAt            DateTime  @updatedAt      @map("updated_at")
 
   org                 Organization         @relation(fields: [orgId], references: [id])
   refreshTokens       RefreshToken[]

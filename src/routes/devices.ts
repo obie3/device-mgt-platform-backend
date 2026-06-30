@@ -4,14 +4,18 @@ import { DeviceStatus, DeviceType, Prisma } from '@prisma/client';
 import { requireRole }            from '../middleware/rbac.js';
 import { logAudit }               from '../services/audit.service.js';
 import { parse as csvParse }      from 'csv-parse/sync';
+import { fileTypeFromBuffer }     from 'file-type';
 import {
   sendAssignmentAckEmail,
   sendApprovalRequestedEmail,
 } from '../services/notification.service.js';
 
-const MAX_IMAGE_SIZE   = 3 * 1024 * 1024; // 3 MB
-const MAX_IMAGES       = 5;
+const MAX_IMAGE_SIZE    = 3 * 1024 * 1024; // 3 MB
+const MAX_IMAGES        = 5;
 const ALLOWED_MIMETYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
+
+// Ack token is valid for 72 hours — Fix #8 (reduced from 7 days)
+const ACK_TOKEN_TTL_MS = 72 * 60 * 60 * 1000;
 
 // ---------------------------------------------------------------------------
 // Status state machine — enforced in the PATCH route.
@@ -640,7 +644,7 @@ export default async function deviceRoutes(fastify: FastifyInstance) {
     // ── Admin: execute directly (original flow) ───────────────────────────
 
     const ackToken     = crypto.randomUUID();
-    const ackExpiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+    const ackExpiresAt = new Date(Date.now() + ACK_TOKEN_TTL_MS);
 
     // If syncDepartment: copy employee's departmentId directly to the device
     // (employee now has a FK departmentId, no string lookup needed)
@@ -786,7 +790,18 @@ export default async function deviceRoutes(fastify: FastifyInstance) {
         chunks.push(chunk as Buffer);
       }
 
-      const result = await fastify.storage.upload(Buffer.concat(chunks), {
+      const buffer = Buffer.concat(chunks);
+
+      // Fix #6 — validate magic bytes, not just the Content-Type header.
+      // A malicious client could send a non-image with a spoofed MIME type.
+      const detected = await fileTypeFromBuffer(buffer);
+      if (!detected || !ALLOWED_MIMETYPES.has(detected.mime)) {
+        return reply.status(400).send({
+          error: `File content does not match an allowed image type (JPEG, PNG, WebP, GIF)`,
+        });
+      }
+
+      const result = await fastify.storage.upload(buffer, {
         filename: part.filename || 'image.jpg',
         mimeType,
         folder:   'device-images',

@@ -7,8 +7,9 @@ async function authPlugin(fastify: FastifyInstance) {
   // Register JWT with the access-token secret.
   // Refresh tokens use a separate secret verified manually in the auth route.
   await fastify.register(fastifyJwt, {
-    secret: config.JWT_ACCESS_SECRET,
-    sign: { expiresIn: config.JWT_ACCESS_EXPIRES_IN },
+    secret:    config.JWT_ACCESS_SECRET,
+    sign:      { algorithm: 'HS256', expiresIn: config.JWT_ACCESS_EXPIRES_IN },
+    verify:    { algorithms: ['HS256'] },
   });
 
   // Decorate with a reusable authenticate hook

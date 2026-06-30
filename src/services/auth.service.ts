@@ -22,9 +22,8 @@ export interface RefreshTokenPayload {
 }
 
 export function signAccessToken(payload: Omit<AccessTokenPayload, 'type'>) {
-  // Cast required: @types/jsonwebtoken@9 tightened expiresIn to StringValue (branded
-  // type from ms). Config values are valid ms strings at runtime but typed as string.
   return jwt.sign({ ...payload, type: 'access' }, config.JWT_ACCESS_SECRET, {
+    algorithm: 'HS256',
     expiresIn: config.JWT_ACCESS_EXPIRES_IN,
   } as jwt.SignOptions);
 }
@@ -33,7 +32,7 @@ export function signRefreshToken(userId: string, jti: string) {
   return jwt.sign(
     { sub: userId, jti, type: 'refresh' },
     config.JWT_REFRESH_SECRET,
-    { expiresIn: config.JWT_REFRESH_EXPIRES_IN } as jwt.SignOptions
+    { algorithm: 'HS256', expiresIn: config.JWT_REFRESH_EXPIRES_IN } as jwt.SignOptions
   );
 }
 
@@ -75,43 +74,69 @@ function refreshExpiresAt(): Date {
 // Auth operations
 // ---------------------------------------------------------------------------
 
+const MAX_FAILED_ATTEMPTS = 5;          // lock after 5 consecutive failures
+const LOCKOUT_DURATION_MS = 30 * 60 * 1000; // 30-minute lockout window
+
+export type LoginResult =
+  | { status: 'ok'; accessToken: string; refreshToken: string; user: Awaited<ReturnType<PrismaClient['user']['findFirst']>> & object }
+  | { status: 'locked'; lockedUntil: Date }
+  | null; // invalid credentials (user not found)
+
 export async function loginUser(
   prisma: PrismaClient,
   email: string,
   password: string
-) {
-  // Email is now unique per-org. For login we find the first active account
-  // matching the email — in practice org email domains are distinct so
-  // collisions are rare; the first-created account wins.
+): Promise<LoginResult> {
   const user = await prisma.user.findFirst({
     where: { email, isActive: true },
     orderBy: { createdAt: 'asc' },
   });
 
+  // Unknown email — return null without leaking whether the account exists
   if (!user) return null;
 
+  // Account lockout check
+  if (user.lockedUntil && user.lockedUntil > new Date()) {
+    return { status: 'locked', lockedUntil: user.lockedUntil };
+  }
+
   const valid = await bcrypt.compare(password, user.passwordHash);
-  if (!valid) return null;
+
+  if (!valid) {
+    const newAttempts = user.failedLoginAttempts + 1;
+    const shouldLock  = newAttempts >= MAX_FAILED_ATTEMPTS;
+    await prisma.user.update({
+      where: { id: user.id },
+      data: {
+        failedLoginAttempts: newAttempts,
+        lockedUntil: shouldLock ? new Date(Date.now() + LOCKOUT_DURATION_MS) : undefined,
+      },
+    });
+    // Return null (not 'locked') so the caller emits the same generic error
+    // message — the lock takes effect on the NEXT attempt.
+    return null;
+  }
+
+  // Successful login — reset failure counters
+  await prisma.user.update({
+    where: { id: user.id },
+    data: { failedLoginAttempts: 0, lockedUntil: null },
+  });
 
   // Issue tokens
   const jti = crypto.randomUUID();
-  const accessToken = signAccessToken({
-    sub: user.id,
-    orgId: user.orgId,
-    role: user.role,
-  });
+  const accessToken  = signAccessToken({ sub: user.id, orgId: user.orgId, role: user.role });
   const refreshToken = signRefreshToken(user.id, jti);
 
-  // Persist hashed refresh token
   await prisma.refreshToken.create({
     data: {
-      userId: user.id,
+      userId:    user.id,
       tokenHash: hashToken(refreshToken),
       expiresAt: refreshExpiresAt(),
     },
   });
 
-  return { accessToken, refreshToken, user };
+  return { status: 'ok', accessToken, refreshToken, user };
 }
 
 /**
@@ -193,8 +218,8 @@ export async function revokeAllUserTokens(
 }
 
 export async function hashPassword(password: string) {
-  // Cost 10: ~100ms — OWASP minimum, well below cost 12's ~400ms
-  return bcrypt.hash(password, 10);
+  // Cost 12: ~250ms — current OWASP recommendation (2024+)
+  return bcrypt.hash(password, 12);
 }
 
 // ---------------------------------------------------------------------------
