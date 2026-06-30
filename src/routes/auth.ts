@@ -1,4 +1,4 @@
-import { FastifyInstance } from 'fastify';
+import { FastifyInstance, FastifyReply } from 'fastify';
 import { z } from 'zod';
 import {
   loginUser,
@@ -39,7 +39,7 @@ const resetPasswordBody = z.object({
 const REFRESH_COOKIE = 'dmp_rt';
 const REFRESH_TTL_S  = 7 * 24 * 60 * 60; // 7 days in seconds
 
-function setRefreshCookie(reply: Parameters<typeof reply.setCookie>[2] extends object ? any : any, token: string) {
+function setRefreshCookie(reply: FastifyReply, token: string) {
   reply.setCookie(REFRESH_COOKIE, token, {
     httpOnly: true,
     secure:   config.NODE_ENV === 'production',
@@ -49,7 +49,7 @@ function setRefreshCookie(reply: Parameters<typeof reply.setCookie>[2] extends o
   });
 }
 
-function clearRefreshCookie(reply: any) {
+function clearRefreshCookie(reply: FastifyReply) {
   reply.clearCookie(REFRESH_COOKIE, {
     httpOnly: true,
     secure:   config.NODE_ENV === 'production',
