@@ -140,18 +140,17 @@ export default async function authRoutes(fastify: FastifyInstance) {
   });
 
   // POST /api/v1/auth/logout
-  fastify.post(
-    '/auth/logout',
-    { preHandler: [fastify.authenticate] },
-    async (request, reply) => {
-      const token = (request.cookies as Record<string, string | undefined>)[REFRESH_COOKIE];
-      if (token) {
-        await revokeRefreshToken(fastify.prisma, token);
-      }
-      clearRefreshCookie(reply);
-      return reply.status(204).send();
+  // No auth required — the cookie IS the credential being revoked. Requiring a
+  // valid access token would prevent logout when the access token has already
+  // expired (e.g. after a session revocation or long inactivity).
+  fastify.post('/auth/logout', async (request, reply) => {
+    const token = (request.cookies as Record<string, string | undefined>)[REFRESH_COOKIE];
+    if (token) {
+      await revokeRefreshToken(fastify.prisma, token).catch(() => {});
     }
-  );
+    clearRefreshCookie(reply);
+    return reply.status(204).send();
+  });
 
   // POST /api/v1/auth/forgot-password
   fastify.post(

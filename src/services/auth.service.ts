@@ -3,6 +3,7 @@ import bcrypt from 'bcryptjs';
 import crypto from 'crypto';
 import jwt from 'jsonwebtoken';
 import { config } from '../config.js';
+import { logAudit } from './audit.service.js';
 
 // ---------------------------------------------------------------------------
 // Token helpers
@@ -79,7 +80,7 @@ const LOCKOUT_DURATION_MS = 30 * 60 * 1000; // 30-minute lockout window
 
 export type LoginResult =
   | { status: 'ok'; accessToken: string; refreshToken: string; user: Awaited<ReturnType<PrismaClient['user']['findFirst']>> & object }
-  | { status: 'locked'; lockedUntil: Date }
+  | { status: 'locked'; lockedUntil: Date; userId: string; orgId: string }
   | null; // invalid credentials (user not found)
 
 export async function loginUser(
@@ -87,8 +88,10 @@ export async function loginUser(
   email: string,
   password: string
 ): Promise<LoginResult> {
+  // Normalise before lookup — prevents case-variant bypass of lockout counters
+  const emailNorm = email.toLowerCase().trim();
   const user = await prisma.user.findFirst({
-    where: { email, isActive: true },
+    where: { email: emailNorm, isActive: true },
     orderBy: { createdAt: 'asc' },
   });
 
@@ -97,7 +100,7 @@ export async function loginUser(
 
   // Account lockout check
   if (user.lockedUntil && user.lockedUntil > new Date()) {
-    return { status: 'locked', lockedUntil: user.lockedUntil };
+    return { status: 'locked', lockedUntil: user.lockedUntil, userId: user.id, orgId: user.orgId };
   }
 
   const valid = await bcrypt.compare(password, user.passwordHash);
@@ -105,13 +108,22 @@ export async function loginUser(
   if (!valid) {
     const newAttempts = user.failedLoginAttempts + 1;
     const shouldLock  = newAttempts >= MAX_FAILED_ATTEMPTS;
+    const lockedUntil = shouldLock ? new Date(Date.now() + LOCKOUT_DURATION_MS) : undefined;
     await prisma.user.update({
       where: { id: user.id },
-      data: {
-        failedLoginAttempts: newAttempts,
-        lockedUntil: shouldLock ? new Date(Date.now() + LOCKOUT_DURATION_MS) : undefined,
-      },
+      data: { failedLoginAttempts: newAttempts, lockedUntil },
     });
+    if (shouldLock) {
+      // Log lockout — security-relevant event indicating a brute-force attempt
+      await logAudit(prisma, {
+        orgId:        user.orgId,
+        userId:       user.id,
+        action:       'user.account_locked',
+        resourceType: 'user',
+        resourceId:   user.id,
+        payload:      { attempts: newAttempts, lockedUntil },
+      }).catch(() => {});  // non-fatal — don't let audit failure block the response
+    }
     // Return null (not 'locked') so the caller emits the same generic error
     // message — the lock takes effect on the NEXT attempt.
     return null;
@@ -229,8 +241,9 @@ export async function hashPassword(password: string) {
 const RESET_TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hour
 
 export async function requestPasswordReset(prisma: PrismaClient, email: string) {
+  const emailNorm = email.toLowerCase().trim();
   const user = await prisma.user.findFirst({
-    where: { email, isActive: true },
+    where: { email: emailNorm, isActive: true },
     orderBy: { createdAt: 'asc' },
   });
   if (!user) return null;
