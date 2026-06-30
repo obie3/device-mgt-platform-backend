@@ -4,7 +4,15 @@ import { DeviceStatus, DeviceType, Prisma } from '@prisma/client';
 import { requireRole }            from '../middleware/rbac.js';
 import { logAudit }               from '../services/audit.service.js';
 import { parse as csvParse }      from 'csv-parse/sync';
-import { fileTypeFromBuffer }     from 'file-type';
+// file-type v22 is ESM-only; use dynamic import so CommonJS can load it.
+// The import is cached by Node's module system after the first call.
+let _fileTypeFromBuffer: typeof import('file-type').fileTypeFromBuffer;
+async function fileTypeFromBuffer(buf: Buffer) {
+  if (!_fileTypeFromBuffer) {
+    ({ fileTypeFromBuffer: _fileTypeFromBuffer } = await import('file-type'));
+  }
+  return _fileTypeFromBuffer(buf);
+}
 import {
   sendAssignmentAckEmail,
   sendApprovalRequestedEmail,
